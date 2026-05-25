@@ -29,7 +29,7 @@ def b24_call(webhook_url, method, params):
 
 def send_message(auth_token, client_endpoint, dialog_id, text):
     # Используем токен авторизации из запроса Битрикс24
-    webhook_url = f"{client_endpoint}rest/{auth_token}/"
+    webhook_url = f"{client_endpoint}{auth_token}/"
     try:
         b24_call(webhook_url, "imbot.message.add", {
             "BOT_ID": BOT_ID,

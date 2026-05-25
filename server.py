@@ -29,7 +29,7 @@ def b24_request(method, params):
 
 def send_message(dialog_id, text):
     try:
-        b24_request("imbot.message.add", {
+        b24_request("im.message.add", {
             "DIALOG_ID": dialog_id,
             "MESSAGE": text
         })

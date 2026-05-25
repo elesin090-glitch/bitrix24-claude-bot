@@ -11,7 +11,12 @@ BOT_ID = os.environ["BITRIX24_BOT_ID"]
 CLIENT_ID = os.environ["BITRIX24_CLIENT_ID"]
 chat_histories = {}
 
+# ID сотрудников, которым доступна управленческая аналитика
+MANAGER_IDS = {"9503", "9335"}
+
 BASE_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
+
+MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"overdue_tasks\"}</action> to show overdue tasks across the company, and <action>{\"type\":\"workload\"}</action> to show how many active tasks each employee has."
 
 WEEKDAYS_RU = [
     "\u043f\u043e\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0438\u043a",
@@ -24,7 +29,7 @@ WEEKDAYS_RU = [
 ]
 
 
-def build_system_prompt():
+def build_system_prompt(is_manager):
     today = datetime.now()
     lines = ["", "", "Today is " + today.strftime("%Y-%m-%d") + " (" + WEEKDAYS_RU[today.weekday()] + ")."]
     lines.append("Upcoming dates for reference:")
@@ -32,7 +37,10 @@ def build_system_prompt():
         d = today + timedelta(days=i)
         lines.append("  " + WEEKDAYS_RU[d.weekday()] + ": " + d.strftime("%Y-%m-%d"))
     lines.append("When the user mentions a weekday or a relative day, use the matching date from this list. Never invent dates and never use dates in the past.")
-    return BASE_PROMPT + "\n".join(lines)
+    prompt = BASE_PROMPT + "\n".join(lines)
+    if is_manager:
+        prompt += MANAGER_PROMPT
+    return prompt
 
 
 def log(msg):
@@ -53,7 +61,7 @@ def b24_call(url, method, params):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -78,10 +86,90 @@ def send_msg(dialog_id, text):
         log(f"send_msg failed: {e}")
 
 
-def do_action(action_json, responsible_id):
+def get_user_names(user_ids):
+    """Возвращает словарь {id: 'Имя Фамилия'} для переданных ID."""
+    names = {}
+    ids = [str(u) for u in user_ids if str(u).isdigit()]
+    if not ids:
+        return names
+    try:
+        r = b24_call(B24_WEBHOOK, "user.get", {"ID": ids})
+        for u in r.get("result", []) or []:
+            uid = str(u.get("ID", ""))
+            full = (str(u.get("NAME", "")) + " " + str(u.get("LAST_NAME", ""))).strip()
+            names[uid] = full if full else ("ID " + uid)
+    except Exception as e:
+        log(f"get_user_names err: {e}")
+    return names
+
+
+def fetch_all_tasks(extra_filter):
+    """Загружает задачи с постраничным проходом (Bitrix отдаёт по 50)."""
+    collected = []
+    start = 0
+    for _ in range(20):
+        r = b24_call(
+            B24_WEBHOOK,
+            "tasks.task.list",
+            {
+                "filter": extra_filter,
+                "select": ["ID", "TITLE", "DEADLINE", "RESPONSIBLE_ID", "STATUS"],
+                "order": {"DEADLINE": "ASC"},
+                "start": start,
+            },
+        )
+        batch = r.get("result", {}).get("tasks", []) or []
+        collected.extend(batch)
+        nxt = r.get("next")
+        if not nxt:
+            break
+        start = nxt
+    return collected
+
+
+def action_overdue_tasks():
+    today = datetime.now().strftime("%Y-%m-%d")
+    tasks = fetch_all_tasks({"<DEADLINE": today, "!STATUS": "5"})
+    overdue = [t for t in tasks if t.get("deadline")]
+    if not overdue:
+        return "\n\u2705 \u041f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447 \u043d\u0435\u0442"
+    resp_ids = {str(t.get("responsibleId")) for t in overdue if t.get("responsibleId")}
+    names = get_user_names(resp_ids)
+    lines = [f"\n\ud83d\udd34 \u041f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d\u043d\u044b\u0435 \u0437\u0430\u0434\u0430\u0447\u0438 ({len(overdue)}):"]
+    for t in overdue[:20]:
+        rid = str(t.get("responsibleId", ""))
+        who = names.get(rid, "ID " + rid)
+        dl = (t.get("deadline") or "")[:10]
+        lines.append(f"\u2022 [{t.get('id')}] {t.get('title')} \u2014 {who}, \u0434\u043e {dl}")
+    if len(overdue) > 20:
+        lines.append(f"... \u0438 \u0435\u0449\u0451 {len(overdue) - 20}")
+    return "\n".join(lines)
+
+
+def action_workload():
+    tasks = fetch_all_tasks({"!STATUS": "5"})
+    counts = {}
+    for t in tasks:
+        rid = str(t.get("responsibleId", ""))
+        if rid and rid != "None":
+            counts[rid] = counts.get(rid, 0) + 1
+    if not counts:
+        return "\n\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
+    names = get_user_names(counts.keys())
+    ordered = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    lines = ["\n\ud83d\udcca \u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u043f\u043e \u0441\u043e\u0442\u0440\u0443\u0434\u043d\u0438\u043a\u0430\u043c:"]
+    for rid, cnt in ordered[:25]:
+        who = names.get(rid, "ID " + rid)
+        lines.append(f"\u2022 {who}: {cnt} \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445")
+    return "\n".join(lines)
+
+
+def do_action(action_json, responsible_id, is_manager):
     try:
         a = json.loads(action_json)
-        if a.get("type") == "create_task":
+        atype = a.get("type")
+
+        if atype == "create_task":
             fields = {
                 "TITLE": a.get("title", "Task"),
                 "DESCRIPTION": a.get("description", ""),
@@ -97,7 +185,8 @@ def do_action(action_json, responsible_id):
             err = r.get("error_description") or r.get("error") or "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430"
             log(f"task.add failed: {r}")
             return f"\n\u26a0\ufe0f \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043e\u0437\u0434\u0430\u0442\u044c \u0437\u0430\u0434\u0430\u0447\u0443: {err}"
-        if a.get("type") == "get_tasks":
+
+        if atype == "get_tasks":
             r = b24_call(
                 B24_WEBHOOK,
                 "tasks.task.list",
@@ -107,13 +196,21 @@ def do_action(action_json, responsible_id):
                     "order": {"DEADLINE": "ASC"},
                 },
             )
-            tasks = r.get("result", {}).get("tasks", [])
+            tasks = r.get("result", {}).get("tasks", []) or []
             if not tasks:
                 return "\n\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
             lines = ["\n\ud83d\udccb \u0417\u0430\u0434\u0430\u0447\u0438:"]
             for t in tasks[:10]:
                 lines.append(f"\u2022 [{t['id']}] {t['title']}")
             return "\n".join(lines)
+
+        if atype in ("overdue_tasks", "workload"):
+            if not is_manager:
+                return "\n\ud83d\udd12 \u042d\u0442\u0430 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044f \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430 \u0442\u043e\u043b\u044c\u043a\u043e \u0440\u0443\u043a\u043e\u0432\u043e\u0434\u0438\u0442\u0435\u043b\u044f\u043c"
+            if atype == "overdue_tasks":
+                return action_overdue_tasks()
+            return action_workload()
+
     except Exception as e:
         log(f"Action err: {e}")
         return "\n\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u0438 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u0438\u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044f"
@@ -121,6 +218,7 @@ def do_action(action_json, responsible_id):
 
 
 def handle(uid, text, dialog_id):
+    is_manager = str(uid) in MANAGER_IDS
     if uid not in chat_histories:
         chat_histories[uid] = []
     hist = chat_histories[uid]
@@ -132,7 +230,7 @@ def handle(uid, text, dialog_id):
         resp = claude.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=1000,
-            system=build_system_prompt(),
+            system=build_system_prompt(is_manager),
             messages=hist,
         )
         reply = resp.content[0].text
@@ -141,7 +239,7 @@ def handle(uid, text, dialog_id):
         if "<action>" in reply and "</action>" in reply:
             s = reply.index("<action>") + 8
             e_idx = reply.index("</action>")
-            extra = do_action(reply[s:e_idx], uid)
+            extra = do_action(reply[s:e_idx], uid, is_manager)
             reply = reply[:reply.index("<action>")] + reply[e_idx + 9:]
         send_msg(dialog_id, reply.strip() + extra)
     except Exception as ex:

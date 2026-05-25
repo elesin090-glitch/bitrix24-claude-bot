@@ -6,11 +6,18 @@ Claude AI Ассистент для Битрикс24
 """
 
 import os
+import sys
 import json
 import httpx
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
+
+# Fix encoding for Russian text
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
 
 app = FastAPI(title="Claude Битрикс24 Ассистент")
 
@@ -201,7 +208,7 @@ async def bitrix_webhook(request: Request):
         return JSONResponse({"status": "ok"})
 
     except Exception as e:
-        print(f"Ошибка вебхука: {e}")
+        print(f"Webhook error: {e}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 

@@ -3,7 +3,6 @@ import os
 import sys
 import json
 import urllib.request
-import urllib.parse
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
@@ -11,6 +10,7 @@ from anthropic import Anthropic
 app = FastAPI()
 claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
+BOT_ID = os.environ.get("BITRIX24_BOT_ID", "17333")
 chat_histories = {}
 
 SYSTEM_PROMPT = "You are an AI assistant for a company integrated into Bitrix24. Always respond in Russian. Help employees with tasks, questions, and reports. When asked to create a task, extract title, deadline, description and return: <action>{\"type\": \"create_task\", \"title\": \"...\", \"description\": \"...\", \"deadline\": \"YYYY-MM-DD\"}</action>. When asked for task list return: <action>{\"type\": \"get_tasks\"}</action>"
@@ -29,7 +29,9 @@ def b24_request(method, params):
 
 def send_message(dialog_id, text):
     try:
-        b24_request("im.message.add", {
+        # Метод для чат-ботов Битрикс24
+        b24_request("imbot.message.add", {
+            "BOT_ID": BOT_ID,
             "DIALOG_ID": dialog_id,
             "MESSAGE": text
         })
@@ -61,15 +63,15 @@ def process_action(action_json):
             )
             task_id = result.get("result", {}).get("task", {}).get("id")
             if task_id:
-                return f"\n✅ Задача создана (ID: {task_id})"
-            return "\n⚠️ Не удалось создать задачу."
+                return f"\n\u2705 \u0417\u0430\u0434\u0430\u0447\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0430 (ID: {task_id})"
+            return "\n\u26a0\ufe0f \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043e\u0437\u0434\u0430\u0442\u044c \u0437\u0430\u0434\u0430\u0447\u0443."
         elif action.get("type") == "get_tasks":
             tasks = get_tasks()
             if not tasks:
-                return "\n📋 Активных задач нет."
-            lines = ["\n📋 Активные задачи:"]
+                return "\n\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447."
+            lines = ["\n\ud83d\udccb \u0410\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u0437\u0430\u0434\u0430\u0447\u0438:"]
             for t in tasks[:10]:
-                lines.append(f"• [{t['id']}] {t['title']} — {t.get('deadline','без срока')}")
+                lines.append(f"\u2022 [{t['id']}] {t['title']} \u2014 {t.get('deadline','\u0431\u0435\u0437 \u0441\u0440\u043e\u043a\u0430')}")
             return "\n".join(lines)
     except Exception as e:
         sys.stderr.write(f"Action error: {e}\n")
@@ -101,7 +103,7 @@ def handle_message(user_id, text, dialog_id):
         send_message(dialog_id, reply.strip() + action_result)
     except Exception as e:
         sys.stderr.write(f"Handle error: {e}\n")
-        send_message(dialog_id, "Извините, произошла ошибка. Повторите запрос.")
+        send_message(dialog_id, "\u0418\u0437\u0432\u0438\u043d\u0438\u0442\u0435, \u043e\u0448\u0438\u0431\u043a\u0430. \u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441.")
 
 @app.get("/")
 async def root():
@@ -111,10 +113,13 @@ async def root():
 async def webhook(request: Request):
     try:
         data = dict(await request.form())
-        if data.get("event") == "ONIMBOTMESSAGEADD":
+        event = data.get("event", "")
+        sys.stderr.write(f"Event: {event}, data keys: {list(data.keys())}\n")
+        if event == "ONIMBOTMESSAGEADD":
             user_id = data.get("data[USER][ID]", "unknown")
             text = data.get("data[PARAMS][MESSAGE]", "")
             dialog_id = data.get("data[PARAMS][DIALOG_ID]", "")
+            sys.stderr.write(f"Message from {user_id}: {text}, dialog: {dialog_id}\n")
             if text and dialog_id:
                 handle_message(user_id, text, dialog_id)
         return JSONResponse({"status": "ok"})

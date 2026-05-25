@@ -13,7 +13,7 @@ chat_histories = {}
 menu_shown = set()
 
 # ID сотрудников, которым доступна управленческая аналитика
-MANAGER_IDS = {"9503", "9335"}
+MANAGER_IDS = {"9503", "9355"}
 
 OVERDUE_WINDOW_DAYS = 90
 UPCOMING_WINDOW_DAYS = 7

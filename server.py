@@ -6,14 +6,13 @@ from anthropic import Anthropic
 app = FastAPI()
 claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
-BOT_ID = os.environ.get("BITRIX24_BOT_ID", "17333")
 chat_histories = {}
 
 SYSTEM_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
 
 def log(msg):
     try:
-        sys.stderr.buffer.write((str(msg) + "\n").encode("utf-8"))
+        sys.stderr.buffer.write((str(msg) + "\n").encode("utf-8", errors="replace"))
         sys.stderr.buffer.flush()
     except Exception:
         pass
@@ -26,17 +25,17 @@ def b24_call(url, method, params):
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode("utf-8"))
 
-def send_msg(endpoint, token, dialog_id, text):
-    url = endpoint + token + "/"
-    try:
-        b24_call(url, "imbot.message.add", {"BOT_ID": BOT_ID, "DIALOG_ID": dialog_id, "MESSAGE": text})
-        log(f"Sent to {dialog_id}")
-    except Exception as e:
-        log(f"Send error: {e}")
+def send_msg(dialog_id, text):
+    # Use main webhook with im.message.add
+    methods = ["im.message.add", "imbot.message.add"]
+    for method in methods:
         try:
-            b24_call(B24_WEBHOOK, "imbot.message.add", {"BOT_ID": BOT_ID, "DIALOG_ID": dialog_id, "MESSAGE": text})
-        except Exception as e2:
-            log(f"Fallback error: {e2}")
+            params = {"DIALOG_ID": dialog_id, "MESSAGE": text}
+            result = b24_call(B24_WEBHOOK, method, params)
+            log(f"Sent via {method}: {result}")
+            return
+        except Exception as e:
+            log(f"Method {method} failed: {e}")
 
 def do_action(action_json):
     try:
@@ -57,26 +56,30 @@ def do_action(action_json):
         log(f"Action err: {e}")
     return ""
 
-def handle(uid, text, dialog_id, endpoint, token):
+def handle(uid, text, dialog_id):
     if uid not in chat_histories: chat_histories[uid] = []
     hist = chat_histories[uid]
     hist.append({"role":"user","content":text})
     if len(hist) > 20: chat_histories[uid] = hist[-20:]; hist = chat_histories[uid]
     try:
-        resp = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000,
-            system=SYSTEM_PROMPT, messages=hist)
+        resp = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=hist
+        )
         reply = resp.content[0].text
         hist.append({"role":"assistant","content":reply})
         extra = ""
         if "<action>" in reply and "</action>" in reply:
             s = reply.index("<action>") + 8
-            e = reply.index("</action>")
-            extra = do_action(reply[s:e])
-            reply = reply[:reply.index("<action>")] + reply[e+9:]
-        send_msg(endpoint, token, dialog_id, reply.strip() + extra)
+            e_idx = reply.index("</action>")
+            extra = do_action(reply[s:e_idx])
+            reply = reply[:reply.index("<action>")] + reply[e_idx+9:]
+        send_msg(dialog_id, reply.strip() + extra)
     except Exception as ex:
         log(f"Handle err: {ex}")
-        send_msg(endpoint, token, dialog_id, "\u041e\u0448\u0438\u0431\u043a\u0430. \u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441.")
+        send_msg(dialog_id, "\u041e\u0448\u0438\u0431\u043a\u0430. \u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441.")
 
 @app.get("/")
 async def root(): return {"status":"ok"}
@@ -89,10 +92,8 @@ async def webhook(request: Request):
             uid = data.get("data[USER][ID]","?")
             text = data.get("data[PARAMS][MESSAGE]","")
             dlg = data.get("data[PARAMS][DIALOG_ID]","")
-            token = data.get("auth[application_token]","")
-            ep = data.get("auth[client_endpoint]","")
-            log(f"Msg uid={uid} dlg={dlg} ep={ep} text={text[:30]}")
-            if text and dlg: handle(uid, text, dlg, ep, token)
+            log(f"Msg uid={uid} dlg={dlg} text={text[:20]}")
+            if text and dlg: handle(uid, text, dlg)
         return JSONResponse({"status":"ok"})
     except Exception as e:
         log(f"Webhook err: {e}")

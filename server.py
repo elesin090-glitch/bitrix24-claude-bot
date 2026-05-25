@@ -18,11 +18,14 @@ MANAGER_IDS = {"9503", "9335"}
 OVERDUE_WINDOW_DAYS = 90
 UPCOMING_WINDOW_DAYS = 7
 
+# Самая ранняя дата задачи, которую показываем в списках
+MIN_TASK_DATE = datetime(2025, 1, 1)
+
 # Облегчённый режим: максимум страниц задач (50 на страницу)
 MAX_TASK_PAGES = 6
 B24_TIMEOUT = 25
-# Сколько строк показывать в списках (ограничение длины сообщения Bitrix)
-LIST_LIMIT = 30
+# Размер одной порции при отправке длинного списка частями
+CHUNK_SIZE = 30
 
 REPORT_MENU = (
     "Доступные отчёты:\n"
@@ -119,6 +122,21 @@ def send_msg(dialog_id, text):
         log(f"send_msg failed: {e}")
 
 
+def send_long(dialog_id, header, lines, footer=""):
+    """Отправляет длинный список частями по CHUNK_SIZE строк."""
+    if not lines:
+        send_msg(dialog_id, header + ("\n" + footer if footer else ""))
+        return
+    total = len(lines)
+    parts = [lines[i:i + CHUNK_SIZE] for i in range(0, total, CHUNK_SIZE)]
+    for idx, part in enumerate(parts, 1):
+        head = header if idx == 1 else f"{header} (продолжение {idx}/{len(parts)})"
+        body = head + "\n" + "\n".join(part)
+        if idx == len(parts) and footer:
+            body += "\n" + footer
+        send_msg(dialog_id, body)
+
+
 def get_user_names(user_ids):
     names = {}
     ids = [str(u) for u in user_ids if str(u).isdigit()]
@@ -168,12 +186,11 @@ def fetch_tasks_limited(extra_filter):
 
 def trunc_note(truncated):
     if truncated:
-        return "\n(Показаны не все задачи — данных в портале много. Для полного отчёта обратитесь к администратору.)"
+        return "(Показаны не все задачи — данных в портале много. Для полного отчёта обратитесь к администратору.)"
     return ""
 
 
 def parent_label(t):
-    """Если задача — подзадача, возвращает пометку про родителя."""
     pid = str(t.get("parentId") or "")
     if pid and pid not in ("0", "None", ""):
         return f" (в составе задачи #{pid})"
@@ -187,19 +204,7 @@ def task_line(t, names, suffix):
     return f"- [{t.get('id')}] {t.get('title')} — {who}{extra}{parent_label(t)}"
 
 
-def render_list(title, items_with_suffix, total_count, truncated):
-    """items_with_suffix: список кортежей (task, suffix). Готовит текст со срезом."""
-    resp_ids = {str(t.get("responsibleId")) for t, _ in items_with_suffix if t.get("responsibleId")}
-    names = get_user_names(list(resp_ids)[:120])
-    lines = [f"{title} — {total_count} задач:"]
-    for t, suffix in items_with_suffix[:LIST_LIMIT]:
-        lines.append(task_line(t, names, suffix))
-    if total_count > LIST_LIMIT:
-        lines.append(f"... и ещё {total_count - LIST_LIMIT} — показаны не все")
-    return "\n".join(lines) + trunc_note(truncated)
-
-
-def action_summary():
+def action_summary(dialog_id):
     today = datetime.now()
     today_day = datetime(today.year, today.month, today.day)
     overdue_start = today - timedelta(days=OVERDUE_WINDOW_DAYS)
@@ -209,9 +214,7 @@ def action_summary():
 
     total = len(all_active)
     subtasks = sum(1 for t in all_active if parent_label(t))
-    overdue = 0
-    upcoming = 0
-    no_deadline = 0
+    overdue = upcoming = no_deadline = 0
     for t in all_active:
         d = parse_date(t.get("deadline"))
         if d is None:
@@ -230,10 +233,13 @@ def action_summary():
     lines.append(f"- Без срока: {no_deadline}")
     lines.append("")
     lines.append("Для детальных списков выберите отчёт 2-5 в меню.")
-    return "\n".join(lines) + trunc_note(truncated)
+    note = trunc_note(truncated)
+    if note:
+        lines.append(note)
+    send_msg(dialog_id, "\n".join(lines))
 
 
-def action_upcoming_tasks():
+def action_upcoming_tasks(dialog_id):
     today = datetime.now()
     today_day = datetime(today.year, today.month, today.day)
     window_end = today_day + timedelta(days=UPCOMING_WINDOW_DAYS)
@@ -247,25 +253,23 @@ def action_upcoming_tasks():
             continue
         if today_day <= d <= window_end:
             upcoming.append((t, d))
-    upcoming.sort(key=lambda x: x[1])
+    # от поздних к ранним
+    upcoming.sort(key=lambda x: x[1], reverse=True)
 
     if not upcoming:
-        return "На ближайшие 7 дней задач с дедлайном нет." + trunc_note(truncated)
+        send_msg(dialog_id, "На ближайшие 7 дней задач с дедлайном нет.")
+        return
 
-    items = []
+    names = get_user_names({str(t.get("responsibleId")) for t, _ in upcoming if t.get("responsibleId")})
+    lines = []
     for t, d in upcoming:
         days_left = (d - today_day).days
-        if days_left == 0:
-            when = "сегодня"
-        elif days_left == 1:
-            when = "завтра"
-        else:
-            when = f"через {days_left} дн."
-        items.append((t, f"срок {d.strftime('%Y-%m-%d')} ({when})"))
-    return render_list("Скоро дедлайн (ближайшие 7 дней)", items, len(items), truncated)
+        when = "сегодня" if days_left == 0 else ("завтра" if days_left == 1 else f"через {days_left} дн.")
+        lines.append(task_line(t, names, f"срок {d.strftime('%Y-%m-%d')} ({when})"))
+    send_long(dialog_id, f"Скоро дедлайн (ближайшие 7 дней) — {len(upcoming)} задач:", lines, trunc_note(truncated))
 
 
-def action_overdue_tasks():
+def action_overdue_tasks(dialog_id):
     today = datetime.now()
     window_start = today - timedelta(days=OVERDUE_WINDOW_DAYS)
 
@@ -278,50 +282,66 @@ def action_overdue_tasks():
             continue
         if window_start <= d < today:
             overdue.append((t, d))
-    overdue.sort(key=lambda x: x[1])
+    overdue.sort(key=lambda x: x[1], reverse=True)
 
     if not overdue:
-        return "Просроченных задач за последние 3 месяца нет." + trunc_note(truncated)
+        send_msg(dialog_id, "Просроченных задач за последние 3 месяца нет.")
+        return
 
-    items = []
+    names = get_user_names({str(t.get("responsibleId")) for t, _ in overdue if t.get("responsibleId")})
+    lines = []
     for t, d in overdue:
         days_late = (today - d).days
-        items.append((t, f"срок {d.strftime('%Y-%m-%d')}, просрочено на {days_late} дн."))
-    return render_list("Просроченные задачи (за 3 месяца)", items, len(items), truncated)
+        lines.append(task_line(t, names, f"срок {d.strftime('%Y-%m-%d')}, просрочено на {days_late} дн."))
+    send_long(dialog_id, f"Просроченные задачи (за 3 месяца) — {len(overdue)} задач:", lines, trunc_note(truncated))
 
 
-def action_all_active():
+def action_all_active(dialog_id):
     all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
-    if not all_active:
-        return "Активных задач нет." + trunc_note(truncated)
-    items = []
+
+    # только задачи с дедлайном с MIN_TASK_DATE и новее
+    dated = []
     for t in all_active:
         d = parse_date(t.get("deadline"))
-        suffix = ("срок " + d.strftime("%Y-%m-%d")) if d else "без срока"
-        items.append((t, suffix))
-    return render_list("Все активные задачи", items, len(items), truncated)
+        if d is not None and d >= MIN_TASK_DATE:
+            dated.append((t, d))
+    dated.sort(key=lambda x: x[1], reverse=True)
+
+    if not dated:
+        send_msg(dialog_id, "Активных задач с 2025 года нет.")
+        return
+
+    names = get_user_names({str(t.get("responsibleId")) for t, _ in dated if t.get("responsibleId")})
+    lines = [task_line(t, names, "срок " + d.strftime("%Y-%m-%d")) for t, d in dated]
+    send_long(dialog_id, f"Все активные задачи (с 2025 года) — {len(dated)} задач:", lines, trunc_note(truncated))
 
 
-def action_no_deadline():
+def action_no_deadline(dialog_id):
     all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
-    items = [(t, "") for t in all_active if parse_date(t.get("deadline")) is None]
-    if not items:
-        return "Задач без срока нет." + trunc_note(truncated)
-    return render_list("Задачи без срока", items, len(items), truncated)
+    no_dl = [t for t in all_active if parse_date(t.get("deadline")) is None]
+
+    if not no_dl:
+        send_msg(dialog_id, "Задач без срока нет.")
+        return
+
+    names = get_user_names({str(t.get("responsibleId")) for t in no_dl if t.get("responsibleId")})
+    lines = [task_line(t, names, "") for t in no_dl]
+    send_long(dialog_id, f"Задачи без срока — {len(no_dl)} задач:", lines, trunc_note(truncated))
 
 
-def run_report(report_type):
+def run_report(report_type, dialog_id):
     if report_type == "summary":
-        return action_summary()
-    if report_type == "upcoming_tasks":
-        return action_upcoming_tasks()
-    if report_type == "overdue_tasks":
-        return action_overdue_tasks()
-    if report_type == "all_active":
-        return action_all_active()
-    if report_type == "no_deadline":
-        return action_no_deadline()
-    return None
+        action_summary(dialog_id)
+    elif report_type == "upcoming_tasks":
+        action_upcoming_tasks(dialog_id)
+    elif report_type == "overdue_tasks":
+        action_overdue_tasks(dialog_id)
+    elif report_type == "all_active":
+        action_all_active(dialog_id)
+    elif report_type == "no_deadline":
+        action_no_deadline(dialog_id)
+    else:
+        send_msg(dialog_id, "[!] Неизвестный отчёт")
 
 
 MENU_CHOICES = {
@@ -333,7 +353,9 @@ MENU_CHOICES = {
 }
 
 
-def do_action(action_json, responsible_id, is_manager):
+def do_action(action_json, responsible_id, is_manager, dialog_id):
+    """Возвращает текст для дописывания к ответу, либо None если отчёт
+    уже отправлен напрямую (отчёты шлются частями сами)."""
     try:
         a = json.loads(action_json)
         atype = a.get("type")
@@ -373,12 +395,16 @@ def do_action(action_json, responsible_id, is_manager):
                 lines.append(f"- [{t['id']}] {t['title']}")
             return "\n".join(lines)
 
-        if atype in ("report_menu", "summary", "upcoming_tasks", "overdue_tasks", "all_active", "no_deadline"):
+        if atype == "report_menu":
             if not is_manager:
                 return "\n[Доступ ограничен] Эта информация доступна только руководителям"
-            if atype == "report_menu":
-                return "\n" + REPORT_MENU
-            return "\n" + run_report(atype)
+            return "\n" + REPORT_MENU
+
+        if atype in ("summary", "upcoming_tasks", "overdue_tasks", "all_active", "no_deadline"):
+            if not is_manager:
+                return "\n[Доступ ограничен] Эта информация доступна только руководителям"
+            run_report(atype, dialog_id)
+            return None
 
     except Exception as e:
         log(f"Action err: {e}")
@@ -395,8 +421,7 @@ def process_message(uid, text, dialog_id):
         if is_manager and uid in menu_shown and stripped in MENU_CHOICES:
             menu_shown.discard(uid)
             send_msg(dialog_id, "Готовлю отчёт, несколько секунд...")
-            report = run_report(MENU_CHOICES[stripped])
-            send_msg(dialog_id, report if report else "[!] Неизвестный отчёт")
+            run_report(MENU_CHOICES[stripped], dialog_id)
             return
 
         if uid not in chat_histories:
@@ -415,16 +440,24 @@ def process_message(uid, text, dialog_id):
         )
         reply = resp.content[0].text
         hist.append({"role": "assistant", "content": reply})
-        extra = ""
+
         if "<action>" in reply and "</action>" in reply:
             s = reply.index("<action>") + 8
             e_idx = reply.index("</action>")
             action_body = reply[s:e_idx]
-            extra = do_action(action_body, uid, is_manager)
-            reply = reply[:reply.index("<action>")] + reply[e_idx + 9:]
+            text_before = reply[:reply.index("<action>")].strip()
+            extra = do_action(action_body, uid, is_manager, dialog_id)
             if '"report_menu"' in action_body and is_manager:
                 menu_shown.add(uid)
-        send_msg(dialog_id, reply.strip() + extra)
+            if extra is None:
+                # отчёт уже отправлен частями; шлём только вступление, если оно было
+                if text_before:
+                    send_msg(dialog_id, text_before)
+            else:
+                rest = reply[e_idx + 9:]
+                send_msg(dialog_id, (text_before + rest).strip() + extra)
+        else:
+            send_msg(dialog_id, reply.strip())
     except Exception as ex:
         log(f"process_message err: {ex}")
         try:

@@ -63,7 +63,7 @@ def handle(uid, text, dialog_id):
     if len(hist) > 20: chat_histories[uid] = hist[-20:]; hist = chat_histories[uid]
     try:
         resp = claude.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=1000,
             system=SYSTEM_PROMPT,
             messages=hist

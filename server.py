@@ -16,10 +16,12 @@ MANAGER_IDS = {"9503", "9335"}
 
 # За сколько дней назад показывать просроченные задачи
 OVERDUE_WINDOW_DAYS = 90
+# На сколько дней вперёд показывать приближающиеся дедлайны
+UPCOMING_WINDOW_DAYS = 7
 
 BASE_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
 
-MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"overdue_tasks\"}</action> to show overdue tasks from the last 3 months with a summary, and <action>{\"type\":\"workload\"}</action> to show how many active tasks each employee has."
+MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"overdue_tasks\"}</action> for overdue tasks from the last 3 months with a summary; <action>{\"type\":\"upcoming_tasks\"}</action> for tasks with a deadline within the next 7 days (deadline soon); <action>{\"type\":\"workload\"}</action> for how many active tasks each employee has."
 
 WEEKDAYS_RU = [
     "\u043f\u043e\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0438\u043a",
@@ -147,14 +149,11 @@ def fetch_all_tasks(extra_filter):
 
 def action_overdue_tasks():
     today = datetime.now()
-    today_str = today.strftime("%Y-%m-%d")
     window_start = today - timedelta(days=OVERDUE_WINDOW_DAYS)
 
-    # Все активные (не закрытые) задачи
     all_active = fetch_all_tasks({"!STATUS": "5"})
     total_active = len(all_active)
 
-    # Просроченные: дедлайн в прошлом и попадает в окно последних 3 месяцев
     overdue = []
     for t in all_active:
         d = parse_date(t.get("deadline"))
@@ -186,6 +185,46 @@ def action_overdue_tasks():
         lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, срок {dl}, просрочено на {days_late} дн.")
     if len(overdue) > 30:
         lines.append(f"... и ещё {len(overdue) - 30}")
+    return "\n" + "\n".join(lines)
+
+
+def action_upcoming_tasks():
+    today = datetime.now()
+    today_day = datetime(today.year, today.month, today.day)
+    window_end = today_day + timedelta(days=UPCOMING_WINDOW_DAYS)
+
+    all_active = fetch_all_tasks({"!STATUS": "5"})
+
+    upcoming = []
+    for t in all_active:
+        d = parse_date(t.get("deadline"))
+        if d is None:
+            continue
+        if today_day <= d <= window_end:
+            upcoming.append((t, d))
+    upcoming.sort(key=lambda x: x[1])
+
+    if not upcoming:
+        return "\nНа ближайшие 7 дней задач с дедлайном нет."
+
+    resp_ids = {str(t.get("responsibleId")) for t, _ in upcoming if t.get("responsibleId")}
+    names = get_user_names(resp_ids)
+
+    lines = [f"Скоро дедлайн (ближайшие 7 дней) — {len(upcoming)} задач:"]
+    for t, d in upcoming[:30]:
+        rid = str(t.get("responsibleId", ""))
+        who = names.get(rid, "ID " + rid)
+        days_left = (d - today_day).days
+        if days_left == 0:
+            when = "сегодня"
+        elif days_left == 1:
+            when = "завтра"
+        else:
+            when = f"через {days_left} дн."
+        dl = d.strftime("%Y-%m-%d")
+        lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, срок {dl} ({when})")
+    if len(upcoming) > 30:
+        lines.append(f"... и ещё {len(upcoming) - 30}")
     return "\n" + "\n".join(lines)
 
 
@@ -247,11 +286,13 @@ def do_action(action_json, responsible_id, is_manager):
                 lines.append(f"- [{t['id']}] {t['title']}")
             return "\n".join(lines)
 
-        if atype in ("overdue_tasks", "workload"):
+        if atype in ("overdue_tasks", "upcoming_tasks", "workload"):
             if not is_manager:
                 return "\n[Доступ ограничен] Эта информация доступна только руководителям"
             if atype == "overdue_tasks":
                 return action_overdue_tasks()
+            if atype == "upcoming_tasks":
+                return action_upcoming_tasks()
             return action_workload()
 
     except Exception as e:

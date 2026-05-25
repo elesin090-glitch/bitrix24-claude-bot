@@ -2,7 +2,8 @@
 import os
 import sys
 import json
-import httpx
+import urllib.request
+import urllib.parse
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
@@ -12,66 +13,69 @@ claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
 chat_histories = {}
 
-SYSTEM_PROMPT = "You are an AI assistant for a company integrated into Bitrix24. Always respond in Russian. Help employees with: 1) TASKS - create, track, get recommendations. 2) QUESTIONS - answer work questions. 3) REPORTS - analyze and summarize. When employee asks to create a task, extract: title, responsible person, deadline, description. Be concise, professional, friendly. If need to create a task, return JSON at the end: <action>{\"type\": \"create_task\", \"title\": \"...\", \"description\": \"...\", \"deadline\": \"YYYY-MM-DD\"}</action>. If need to get task list: <action>{\"type\": \"get_tasks\"}</action>"
+SYSTEM_PROMPT = "You are an AI assistant for a company integrated into Bitrix24. Always respond in Russian. Help employees with tasks, questions, and reports. When asked to create a task, extract title, deadline, description and return: <action>{\"type\": \"create_task\", \"title\": \"...\", \"description\": \"...\", \"deadline\": \"YYYY-MM-DD\"}</action>. When asked for task list return: <action>{\"type\": \"get_tasks\"}</action>"
 
-async def b24_request(method: str, params: dict) -> dict:
-    url = f"{B24_WEBHOOK}{method}"
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            url,
-            json=params,
-            timeout=15,
-            headers={"Content-Type": "application/json; charset=utf-8"}
-        )
-        return r.json()
+def b24_request(method, params):
+    url = (B24_WEBHOOK + method).encode('ascii')
+    data = json.dumps(params, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={'Content-Type': 'application/json; charset=utf-8'},
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode('utf-8'))
 
-async def create_task(title: str, description: str = "", deadline: str = "") -> dict:
+def send_message(dialog_id, text):
+    try:
+        b24_request("imbot.message.add", {
+            "DIALOG_ID": dialog_id,
+            "MESSAGE": text
+        })
+    except Exception as e:
+        sys.stderr.write(f"Send error: {e}\n")
+
+def create_task(title, description="", deadline=""):
     fields = {"TITLE": title, "DESCRIPTION": description}
     if deadline:
         fields["DEADLINE"] = deadline
-    return await b24_request("tasks.task.add", {"fields": fields})
+    return b24_request("tasks.task.add", {"fields": fields})
 
-async def get_tasks() -> list:
-    result = await b24_request("tasks.task.list", {
+def get_tasks():
+    result = b24_request("tasks.task.list", {
         "filter": {"STATUS": "2"},
-        "select": ["ID", "TITLE", "DEADLINE", "STATUS"],
+        "select": ["ID", "TITLE", "DEADLINE"],
         "order": {"DEADLINE": "ASC"}
     })
     return result.get("result", {}).get("tasks", [])
 
-async def send_message(dialog_id: str, text: str):
-    await b24_request("imbot.message.add", {
-        "DIALOG_ID": dialog_id,
-        "MESSAGE": text
-    })
-
-async def process_action(action_json: str) -> str:
+def process_action(action_json):
     try:
         action = json.loads(action_json)
         if action.get("type") == "create_task":
-            result = await create_task(
+            result = create_task(
                 title=action.get("title", "New task"),
                 description=action.get("description", ""),
                 deadline=action.get("deadline", "")
             )
             task_id = result.get("result", {}).get("task", {}).get("id")
             if task_id:
-                return f"\n\u2705 Zadacha sozdana (ID: {task_id})"
-            return "\n\u26a0\ufe0f Ne udalos sozdat zadachu."
+                return f"\n✅ Задача создана (ID: {task_id})"
+            return "\n⚠️ Не удалось создать задачу."
         elif action.get("type") == "get_tasks":
-            tasks = await get_tasks()
+            tasks = get_tasks()
             if not tasks:
-                return "\n Aktivnykh zadach net."
-            lines = ["\n Aktivnye zadachi:"]
+                return "\n📋 Активных задач нет."
+            lines = ["\n📋 Активные задачи:"]
             for t in tasks[:10]:
-                deadline = t.get("deadline", "bez sroka")
-                lines.append(f"[{t['id']}] {t['title']} - srok: {deadline}")
+                lines.append(f"• [{t['id']}] {t['title']} — {t.get('deadline','без срока')}")
             return "\n".join(lines)
     except Exception as e:
-        sys.stderr.write(f"Action error: {str(e)}\n")
+        sys.stderr.write(f"Action error: {e}\n")
     return ""
 
-async def handle_message(user_id: str, text: str, dialog_id: str):
+def handle_message(user_id, text, dialog_id):
     if user_id not in chat_histories:
         chat_histories[user_id] = []
     history = chat_histories[user_id]
@@ -92,34 +96,28 @@ async def handle_message(user_id: str, text: str, dialog_id: str):
         if "<action>" in reply and "</action>" in reply:
             start = reply.index("<action>") + 8
             end = reply.index("</action>")
-            action_json = reply[start:end]
-            action_result = await process_action(action_json)
+            action_result = process_action(reply[start:end])
             reply = reply[:reply.index("<action>")] + reply[end + 9:]
-        final = reply.strip() + action_result
-        await send_message(dialog_id, final)
+        send_message(dialog_id, reply.strip() + action_result)
     except Exception as e:
-        sys.stderr.write(f"Handle error: {str(e)}\n")
-        try:
-            await send_message(dialog_id, "Izvinite, proizoshla oshibka. Pojaluysta, povtorite zapros.")
-        except Exception:
-            pass
+        sys.stderr.write(f"Handle error: {e}\n")
+        send_message(dialog_id, "Извините, произошла ошибка. Повторите запрос.")
 
 @app.get("/")
 async def root():
-    return {"status": "Claude Bitrix24 Assistant is running"}
+    return {"status": "running"}
 
 @app.post("/webhook/bitrix")
 async def webhook(request: Request):
     try:
         data = dict(await request.form())
-        event = data.get("event", "")
-        if event == "ONIMBOTMESSAGEADD":
+        if data.get("event") == "ONIMBOTMESSAGEADD":
             user_id = data.get("data[USER][ID]", "unknown")
             text = data.get("data[PARAMS][MESSAGE]", "")
             dialog_id = data.get("data[PARAMS][DIALOG_ID]", "")
             if text and dialog_id:
-                await handle_message(user_id, text, dialog_id)
+                handle_message(user_id, text, dialog_id)
         return JSONResponse({"status": "ok"})
     except Exception as e:
-        sys.stderr.write(f"Webhook error: {str(e)}\n")
+        sys.stderr.write(f"Webhook error: {e}\n")
         return JSONResponse({"status": "error"}, status_code=500)

@@ -1,8 +1,4 @@
-# -*- coding: utf-8 -*-
-import os
-import sys
-import json
-import urllib.request
+import os, sys, json, urllib.request
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
@@ -13,128 +9,91 @@ B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
 BOT_ID = os.environ.get("BITRIX24_BOT_ID", "17333")
 chat_histories = {}
 
-SYSTEM_PROMPT = "You are an AI assistant for a company integrated into Bitrix24. Always respond in Russian. Help employees with tasks, questions, and reports. When asked to create a task, return: <action>{\"type\": \"create_task\", \"title\": \"...\", \"description\": \"...\", \"deadline\": \"YYYY-MM-DD\"}</action>. When asked for task list return: <action>{\"type\": \"get_tasks\"}</action>"
+SYSTEM_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
 
-def b24_call(webhook_url, method, params):
-    url = webhook_url + method
-    data = json.dumps(params, ensure_ascii=False).encode('utf-8')
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={'Content-Type': 'application/json; charset=utf-8'},
-        method='POST'
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode('utf-8'))
-
-def send_message(auth_token, client_endpoint, dialog_id, text):
-    # Используем токен авторизации из запроса Битрикс24
-    webhook_url = f"{client_endpoint}{auth_token}/"
+def log(msg):
     try:
-        b24_call(webhook_url, "imbot.message.add", {
-            "BOT_ID": BOT_ID,
-            "DIALOG_ID": dialog_id,
-            "MESSAGE": text.encode('utf-8').decode('utf-8')
-        })
-        sys.stderr.write(f"Message sent to dialog {dialog_id}\n")
+        sys.stderr.buffer.write((str(msg) + "\n").encode("utf-8"))
+        sys.stderr.buffer.flush()
+    except Exception:
+        pass
+
+def b24_call(url, method, params):
+    full_url = url + method
+    data = json.dumps(params, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(full_url, data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def send_msg(endpoint, token, dialog_id, text):
+    url = endpoint + token + "/"
+    try:
+        b24_call(url, "imbot.message.add", {"BOT_ID": BOT_ID, "DIALOG_ID": dialog_id, "MESSAGE": text})
+        log(f"Sent to {dialog_id}")
     except Exception as e:
-        sys.stderr.write(f"Send error with auth token: {e}\n")
-        # Fallback to main webhook
+        log(f"Send error: {e}")
         try:
-            b24_call(B24_WEBHOOK, "imbot.message.add", {
-                "BOT_ID": BOT_ID,
-                "DIALOG_ID": dialog_id,
-                "MESSAGE": text.encode('utf-8').decode('utf-8')
-            })
+            b24_call(B24_WEBHOOK, "imbot.message.add", {"BOT_ID": BOT_ID, "DIALOG_ID": dialog_id, "MESSAGE": text})
         except Exception as e2:
-            sys.stderr.write(f"Send fallback error: {e2}\n")
+            log(f"Fallback error: {e2}")
 
-def create_task(title, description="", deadline=""):
-    fields = {"TITLE": title, "DESCRIPTION": description}
-    if deadline:
-        fields["DEADLINE"] = deadline
-    return b24_call(B24_WEBHOOK, "tasks.task.add", {"fields": fields})
-
-def get_tasks():
-    result = b24_call(B24_WEBHOOK, "tasks.task.list", {
-        "filter": {"STATUS": "2"},
-        "select": ["ID", "TITLE", "DEADLINE"],
-        "order": {"DEADLINE": "ASC"}
-    })
-    return result.get("result", {}).get("tasks", [])
-
-def process_action(action_json):
+def do_action(action_json):
     try:
-        action = json.loads(action_json)
-        if action.get("type") == "create_task":
-            result = create_task(
-                title=action.get("title", "New task"),
-                description=action.get("description", ""),
-                deadline=action.get("deadline", "")
-            )
-            task_id = result.get("result", {}).get("task", {}).get("id")
-            if task_id:
-                return f"\n\u2705 \u0417\u0430\u0434\u0430\u0447\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0430 (ID: {task_id})"
-            return "\n\u26a0\ufe0f \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043e\u0437\u0434\u0430\u0442\u044c \u0437\u0430\u0434\u0430\u0447\u0443."
-        elif action.get("type") == "get_tasks":
-            tasks = get_tasks()
-            if not tasks:
-                return "\n\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447."
-            lines = ["\n\ud83d\udccb \u0410\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u0437\u0430\u0434\u0430\u0447\u0438:"]
-            for t in tasks[:10]:
-                lines.append(f"\u2022 [{t['id']}] {t['title']} \u2014 {t.get('deadline', '\u0431\u0435\u0437 \u0441\u0440\u043e\u043a\u0430')}")
+        a = json.loads(action_json)
+        if a.get("type") == "create_task":
+            fields = {"TITLE": a.get("title","Task"), "DESCRIPTION": a.get("description","")}
+            if a.get("deadline"): fields["DEADLINE"] = a["deadline"]
+            r = b24_call(B24_WEBHOOK, "tasks.task.add", {"fields": fields})
+            tid = r.get("result",{}).get("task",{}).get("id")
+            return f"\n\u2705 \u0417\u0430\u0434\u0430\u0447\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0430 (ID: {tid})" if tid else "\n\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430"
+        if a.get("type") == "get_tasks":
+            r = b24_call(B24_WEBHOOK, "tasks.task.list", {"filter":{"STATUS":"2"},"select":["ID","TITLE","DEADLINE"],"order":{"DEADLINE":"ASC"}})
+            tasks = r.get("result",{}).get("tasks",[])
+            if not tasks: return "\n\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
+            lines = ["\n\ud83d\udccb \u0417\u0430\u0434\u0430\u0447\u0438:"] + [f"\u2022 [{t['id']}] {t['title']}" for t in tasks[:10]]
             return "\n".join(lines)
     except Exception as e:
-        sys.stderr.write(f"Action error: {e}\n")
+        log(f"Action err: {e}")
     return ""
 
-def handle_message(user_id, text, dialog_id, auth_token, client_endpoint):
-    if user_id not in chat_histories:
-        chat_histories[user_id] = []
-    history = chat_histories[user_id]
-    history.append({"role": "user", "content": text})
-    if len(history) > 20:
-        chat_histories[user_id] = history[-20:]
-        history = chat_histories[user_id]
+def handle(uid, text, dialog_id, endpoint, token):
+    if uid not in chat_histories: chat_histories[uid] = []
+    hist = chat_histories[uid]
+    hist.append({"role":"user","content":text})
+    if len(hist) > 20: chat_histories[uid] = hist[-20:]; hist = chat_histories[uid]
     try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=history
-        )
-        reply = response.content[0].text
-        history.append({"role": "assistant", "content": reply})
-        action_result = ""
+        resp = claude.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000,
+            system=SYSTEM_PROMPT, messages=hist)
+        reply = resp.content[0].text
+        hist.append({"role":"assistant","content":reply})
+        extra = ""
         if "<action>" in reply and "</action>" in reply:
-            start = reply.index("<action>") + 8
-            end = reply.index("</action>")
-            action_result = process_action(reply[start:end])
-            reply = reply[:reply.index("<action>")] + reply[end + 9:]
-        final = reply.strip() + action_result
-        send_message(auth_token, client_endpoint, dialog_id, final)
-    except Exception as e:
-        sys.stderr.write(f"Handle error: {e}\n")
+            s = reply.index("<action>") + 8
+            e = reply.index("</action>")
+            extra = do_action(reply[s:e])
+            reply = reply[:reply.index("<action>")] + reply[e+9:]
+        send_msg(endpoint, token, dialog_id, reply.strip() + extra)
+    except Exception as ex:
+        log(f"Handle err: {ex}")
+        send_msg(endpoint, token, dialog_id, "\u041e\u0448\u0438\u0431\u043a\u0430. \u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441.")
 
 @app.get("/")
-async def root():
-    return {"status": "running"}
+async def root(): return {"status":"ok"}
 
 @app.post("/webhook/bitrix")
 async def webhook(request: Request):
     try:
         data = dict(await request.form())
-        event = data.get("event", "")
-        if event == "ONIMBOTMESSAGEADD":
-            user_id = data.get("data[USER][ID]", "unknown")
-            text = data.get("data[PARAMS][MESSAGE]", "")
-            dialog_id = data.get("data[PARAMS][DIALOG_ID]", "")
-            auth_token = data.get("auth[application_token]", "")
-            client_endpoint = data.get("auth[client_endpoint]", "")
-            sys.stderr.write(f"Msg from {user_id}: {text}, dialog: {dialog_id}, endpoint: {client_endpoint}\n")
-            if text and dialog_id:
-                handle_message(user_id, text, dialog_id, auth_token, client_endpoint)
-        return JSONResponse({"status": "ok"})
+        if data.get("event") == "ONIMBOTMESSAGEADD":
+            uid = data.get("data[USER][ID]","?")
+            text = data.get("data[PARAMS][MESSAGE]","")
+            dlg = data.get("data[PARAMS][DIALOG_ID]","")
+            token = data.get("auth[application_token]","")
+            ep = data.get("auth[client_endpoint]","")
+            log(f"Msg uid={uid} dlg={dlg} ep={ep} text={text[:30]}")
+            if text and dlg: handle(uid, text, dlg, ep, token)
+        return JSONResponse({"status":"ok"})
     except Exception as e:
-        sys.stderr.write(f"Webhook error: {e}\n")
-        return JSONResponse({"status": "error"}, status_code=500)
+        log(f"Webhook err: {e}")
+        return JSONResponse({"status":"error"}, status_code=500)

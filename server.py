@@ -14,9 +14,12 @@ chat_histories = {}
 # ID сотрудников, которым доступна управленческая аналитика
 MANAGER_IDS = {"9503", "9335"}
 
+# За сколько дней назад показывать просроченные задачи
+OVERDUE_WINDOW_DAYS = 90
+
 BASE_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
 
-MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"overdue_tasks\"}</action> to show overdue tasks across the company, and <action>{\"type\":\"workload\"}</action> to show how many active tasks each employee has."
+MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"overdue_tasks\"}</action> to show overdue tasks from the last 3 months with a summary, and <action>{\"type\":\"workload\"}</action> to show how many active tasks each employee has."
 
 WEEKDAYS_RU = [
     "\u043f\u043e\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0438\u043a",
@@ -54,6 +57,16 @@ def log(msg):
 def safe_text(s):
     """Убирает битые суррогатные символы, чтобы текст всегда кодировался в UTF-8."""
     return s.encode("utf-8", errors="ignore").decode("utf-8")
+
+
+def parse_date(s):
+    """Парсит дату из строки Bitrix (берёт первые 10 символов YYYY-MM-DD)."""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d")
+    except Exception:
+        return None
 
 
 def b24_call(url, method, params):
@@ -133,22 +146,47 @@ def fetch_all_tasks(extra_filter):
 
 
 def action_overdue_tasks():
-    today = datetime.now().strftime("%Y-%m-%d")
-    tasks = fetch_all_tasks({"<DEADLINE": today, "!STATUS": "5"})
-    overdue = [t for t in tasks if t.get("deadline")]
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    window_start = today - timedelta(days=OVERDUE_WINDOW_DAYS)
+
+    # Все активные (не закрытые) задачи
+    all_active = fetch_all_tasks({"!STATUS": "5"})
+    total_active = len(all_active)
+
+    # Просроченные: дедлайн в прошлом и попадает в окно последних 3 месяцев
+    overdue = []
+    for t in all_active:
+        d = parse_date(t.get("deadline"))
+        if d is None:
+            continue
+        if window_start <= d < today:
+            overdue.append((t, d))
+    overdue.sort(key=lambda x: x[1])
+
+    lines = ["Сводка по задачам:"]
+    lines.append(f"- Всего активных задач: {total_active}")
+    lines.append(f"- Просрочено за последние 3 месяца: {len(overdue)}")
+
     if not overdue:
-        return "\n[OK] Просроченных задач нет"
-    resp_ids = {str(t.get("responsibleId")) for t in overdue if t.get("responsibleId")}
+        lines.append("")
+        lines.append("Просроченных задач за последние 3 месяца нет.")
+        return "\n" + "\n".join(lines)
+
+    resp_ids = {str(t.get("responsibleId")) for t, _ in overdue if t.get("responsibleId")}
     names = get_user_names(resp_ids)
-    lines = [f"\nПросроченные задачи ({len(overdue)}):"]
-    for t in overdue[:20]:
+
+    lines.append("")
+    lines.append("Просроченные задачи (за 3 месяца):")
+    for t, d in overdue[:30]:
         rid = str(t.get("responsibleId", ""))
         who = names.get(rid, "ID " + rid)
-        dl = (t.get("deadline") or "")[:10]
-        lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, до {dl}")
-    if len(overdue) > 20:
-        lines.append(f"... и ещё {len(overdue) - 20}")
-    return "\n".join(lines)
+        days_late = (today - d).days
+        dl = d.strftime("%Y-%m-%d")
+        lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, срок {dl}, просрочено на {days_late} дн.")
+    if len(overdue) > 30:
+        lines.append(f"... и ещё {len(overdue) - 30}")
+    return "\n" + "\n".join(lines)
 
 
 def action_workload():

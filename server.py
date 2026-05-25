@@ -51,6 +51,11 @@ def log(msg):
         pass
 
 
+def safe_text(s):
+    """Убирает битые суррогатные символы, чтобы текст всегда кодировался в UTF-8."""
+    return s.encode("utf-8", errors="ignore").decode("utf-8")
+
+
 def b24_call(url, method, params):
     full_url = url + method
     data = json.dumps(params, ensure_ascii=False).encode("utf-8")
@@ -78,7 +83,7 @@ def send_msg(dialog_id, text):
             "BOT_ID": BOT_ID,
             "CLIENT_ID": CLIENT_ID,
             "DIALOG_ID": dialog_id,
-            "MESSAGE": text,
+            "MESSAGE": safe_text(text),
         }
         result = b24_call(B24_WEBHOOK, "imbot.message.add", params)
         log(f"Sent: {result}")
@@ -132,17 +137,17 @@ def action_overdue_tasks():
     tasks = fetch_all_tasks({"<DEADLINE": today, "!STATUS": "5"})
     overdue = [t for t in tasks if t.get("deadline")]
     if not overdue:
-        return "\n\u2705 \u041f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447 \u043d\u0435\u0442"
+        return "\n[OK] Просроченных задач нет"
     resp_ids = {str(t.get("responsibleId")) for t in overdue if t.get("responsibleId")}
     names = get_user_names(resp_ids)
-    lines = [f"\n\ud83d\udd34 \u041f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d\u043d\u044b\u0435 \u0437\u0430\u0434\u0430\u0447\u0438 ({len(overdue)}):"]
+    lines = [f"\nПросроченные задачи ({len(overdue)}):"]
     for t in overdue[:20]:
         rid = str(t.get("responsibleId", ""))
         who = names.get(rid, "ID " + rid)
         dl = (t.get("deadline") or "")[:10]
-        lines.append(f"\u2022 [{t.get('id')}] {t.get('title')} \u2014 {who}, \u0434\u043e {dl}")
+        lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, до {dl}")
     if len(overdue) > 20:
-        lines.append(f"... \u0438 \u0435\u0449\u0451 {len(overdue) - 20}")
+        lines.append(f"... и ещё {len(overdue) - 20}")
     return "\n".join(lines)
 
 
@@ -154,13 +159,13 @@ def action_workload():
         if rid and rid != "None":
             counts[rid] = counts.get(rid, 0) + 1
     if not counts:
-        return "\n\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
+        return "\nНет активных задач"
     names = get_user_names(counts.keys())
     ordered = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    lines = ["\n\ud83d\udcca \u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u043f\u043e \u0441\u043e\u0442\u0440\u0443\u0434\u043d\u0438\u043a\u0430\u043c:"]
+    lines = ["\nЗагрузка по сотрудникам:"]
     for rid, cnt in ordered[:25]:
         who = names.get(rid, "ID " + rid)
-        lines.append(f"\u2022 {who}: {cnt} \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445")
+        lines.append(f"- {who}: {cnt} активных")
     return "\n".join(lines)
 
 
@@ -181,10 +186,10 @@ def do_action(action_json, responsible_id, is_manager):
             r = b24_call(B24_WEBHOOK, "tasks.task.add", {"fields": fields})
             tid = r.get("result", {}).get("task", {}).get("id")
             if tid:
-                return f"\n\u2705 \u0417\u0430\u0434\u0430\u0447\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0430 (ID: {tid})"
-            err = r.get("error_description") or r.get("error") or "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430"
+                return f"\n[OK] Задача создана (ID: {tid})"
+            err = r.get("error_description") or r.get("error") or "неизвестная ошибка"
             log(f"task.add failed: {r}")
-            return f"\n\u26a0\ufe0f \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043e\u0437\u0434\u0430\u0442\u044c \u0437\u0430\u0434\u0430\u0447\u0443: {err}"
+            return f"\n[!] Не удалось создать задачу: {err}"
 
         if atype == "get_tasks":
             r = b24_call(
@@ -198,22 +203,22 @@ def do_action(action_json, responsible_id, is_manager):
             )
             tasks = r.get("result", {}).get("tasks", []) or []
             if not tasks:
-                return "\n\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
-            lines = ["\n\ud83d\udccb \u0417\u0430\u0434\u0430\u0447\u0438:"]
+                return "\nНет активных задач"
+            lines = ["\nЗадачи:"]
             for t in tasks[:10]:
-                lines.append(f"\u2022 [{t['id']}] {t['title']}")
+                lines.append(f"- [{t['id']}] {t['title']}")
             return "\n".join(lines)
 
         if atype in ("overdue_tasks", "workload"):
             if not is_manager:
-                return "\n\ud83d\udd12 \u042d\u0442\u0430 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044f \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430 \u0442\u043e\u043b\u044c\u043a\u043e \u0440\u0443\u043a\u043e\u0432\u043e\u0434\u0438\u0442\u0435\u043b\u044f\u043c"
+                return "\n[Доступ ограничен] Эта информация доступна только руководителям"
             if atype == "overdue_tasks":
                 return action_overdue_tasks()
             return action_workload()
 
     except Exception as e:
         log(f"Action err: {e}")
-        return "\n\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u0438 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u0438\u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044f"
+        return "\n[!] Ошибка при выполнении действия"
     return ""
 
 
@@ -244,7 +249,7 @@ def handle(uid, text, dialog_id):
         send_msg(dialog_id, reply.strip() + extra)
     except Exception as ex:
         log(f"Handle err: {ex}")
-        send_msg(dialog_id, "\u041e\u0448\u0438\u0431\u043a\u0430. \u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441.")
+        send_msg(dialog_id, "Ошибка. Повторите запрос.")
 
 
 @app.get("/")

@@ -1,6 +1,6 @@
 import os, sys, json, urllib.request
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
 
@@ -10,7 +10,7 @@ B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
 BOT_ID = os.environ["BITRIX24_BOT_ID"]
 CLIENT_ID = os.environ["BITRIX24_CLIENT_ID"]
 chat_histories = {}
-# Запоминаем, что руководителю показано меню отчётов (чтобы понять цифру в ответ)
+# Запоминаем, что руководителю показано меню отчётов
 menu_shown = set()
 
 # ID сотрудников, которым доступна управленческая аналитика
@@ -91,7 +91,7 @@ def b24_call(url, method, params):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -137,7 +137,7 @@ def fetch_all_tasks(extra_filter):
     """Загружает задачи с постраничным проходом (Bitrix отдаёт по 50)."""
     collected = []
     start = 0
-    for _ in range(20):
+    for _ in range(40):
         r = b24_call(
             B24_WEBHOOK,
             "tasks.task.list",
@@ -180,7 +180,7 @@ def action_overdue_tasks():
     if not overdue:
         lines.append("")
         lines.append("Просроченных задач за последние 3 месяца нет.")
-        return "\n" + "\n".join(lines)
+        return "\n".join(lines)
 
     resp_ids = {str(t.get("responsibleId")) for t, _ in overdue if t.get("responsibleId")}
     names = get_user_names(resp_ids)
@@ -195,7 +195,7 @@ def action_overdue_tasks():
         lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, срок {dl}, просрочено на {days_late} дн.")
     if len(overdue) > 30:
         lines.append(f"... и ещё {len(overdue) - 30}")
-    return "\n" + "\n".join(lines)
+    return "\n".join(lines)
 
 
 def action_upcoming_tasks():
@@ -215,7 +215,7 @@ def action_upcoming_tasks():
     upcoming.sort(key=lambda x: x[1])
 
     if not upcoming:
-        return "\nНа ближайшие 7 дней задач с дедлайном нет."
+        return "На ближайшие 7 дней задач с дедлайном нет."
 
     resp_ids = {str(t.get("responsibleId")) for t, _ in upcoming if t.get("responsibleId")}
     names = get_user_names(resp_ids)
@@ -235,7 +235,7 @@ def action_upcoming_tasks():
         lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, срок {dl} ({when})")
     if len(upcoming) > 30:
         lines.append(f"... и ещё {len(upcoming) - 30}")
-    return "\n" + "\n".join(lines)
+    return "\n".join(lines)
 
 
 def action_workload():
@@ -246,10 +246,10 @@ def action_workload():
         if rid and rid != "None":
             counts[rid] = counts.get(rid, 0) + 1
     if not counts:
-        return "\nНет активных задач"
+        return "Нет активных задач"
     names = get_user_names(counts.keys())
     ordered = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    lines = ["\nЗагрузка по сотрудникам:"]
+    lines = ["Загрузка по сотрудникам:"]
     for rid, cnt in ordered[:25]:
         who = names.get(rid, "ID " + rid)
         lines.append(f"- {who}: {cnt} активных")
@@ -320,7 +320,7 @@ def do_action(action_json, responsible_id, is_manager):
                 return "\n[Доступ ограничен] Эта информация доступна только руководителям"
             if atype == "report_menu":
                 return "\n" + REPORT_MENU
-            return run_report(atype)
+            return "\n" + run_report(atype)
 
     except Exception as e:
         log(f"Action err: {e}")
@@ -328,25 +328,27 @@ def do_action(action_json, responsible_id, is_manager):
     return ""
 
 
-def handle(uid, text, dialog_id):
-    is_manager = str(uid) in MANAGER_IDS
-    stripped = text.strip()
-
-    # Если руководителю было показано меню и он прислал цифру — сразу запускаем отчёт
-    if is_manager and uid in menu_shown and stripped in MENU_CHOICES:
-        menu_shown.discard(uid)
-        report = run_report(MENU_CHOICES[stripped])
-        send_msg(dialog_id, report if report else "[!] Неизвестный отчёт")
-        return
-
-    if uid not in chat_histories:
-        chat_histories[uid] = []
-    hist = chat_histories[uid]
-    hist.append({"role": "user", "content": text})
-    if len(hist) > 20:
-        chat_histories[uid] = hist[-20:]
-        hist = chat_histories[uid]
+def process_message(uid, text, dialog_id):
+    """Тяжёлая обработка — выполняется в фоне, Bitrix её уже не ждёт."""
     try:
+        is_manager = str(uid) in MANAGER_IDS
+        stripped = text.strip()
+
+        # Руководитель прислал цифру сразу после меню — запускаем отчёт
+        if is_manager and uid in menu_shown and stripped in MENU_CHOICES:
+            menu_shown.discard(uid)
+            report = run_report(MENU_CHOICES[stripped])
+            send_msg(dialog_id, report if report else "[!] Неизвестный отчёт")
+            return
+
+        if uid not in chat_histories:
+            chat_histories[uid] = []
+        hist = chat_histories[uid]
+        hist.append({"role": "user", "content": text})
+        if len(hist) > 20:
+            chat_histories[uid] = hist[-20:]
+            hist = chat_histories[uid]
+
         resp = claude.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=1000,
@@ -362,13 +364,15 @@ def handle(uid, text, dialog_id):
             action_body = reply[s:e_idx]
             extra = do_action(action_body, uid, is_manager)
             reply = reply[:reply.index("<action>")] + reply[e_idx + 9:]
-            # Если показали меню — запоминаем, чтобы понять цифру в следующем сообщении
             if '"report_menu"' in action_body and is_manager:
                 menu_shown.add(uid)
         send_msg(dialog_id, reply.strip() + extra)
     except Exception as ex:
-        log(f"Handle err: {ex}")
-        send_msg(dialog_id, "Ошибка. Повторите запрос.")
+        log(f"process_message err: {ex}")
+        try:
+            send_msg(dialog_id, "Ошибка. Повторите запрос.")
+        except Exception:
+            pass
 
 
 @app.get("/")
@@ -377,7 +381,7 @@ async def root():
 
 
 @app.post("/webhook/bitrix")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         data = dict(await request.form())
         if data.get("event") == "ONIMBOTMESSAGEADD":
@@ -386,7 +390,8 @@ async def webhook(request: Request):
             dlg = data.get("data[PARAMS][DIALOG_ID]", "")
             log(f"Msg uid={uid} dlg={dlg} text={text[:20]}")
             if text and dlg:
-                handle(uid, text, dlg)
+                # Тяжёлую работу уводим в фон, Bitrix получает ответ сразу
+                background_tasks.add_task(process_message, uid, text, dlg)
         return JSONResponse({"status": "ok"})
     except Exception as e:
         log(f"Webhook err: {e}")

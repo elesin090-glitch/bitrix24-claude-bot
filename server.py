@@ -126,3 +126,4 @@ async def webhook(request: Request):
     except Exception as e:
         sys.stderr.write(f"Webhook error: {e}\n")
         return JSONResponse({"status": "error"}, status_code=500)
+

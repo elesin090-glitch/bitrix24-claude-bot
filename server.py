@@ -1,241 +1,118 @@
-"""
-Claude AI Ассистент для Битрикс24
-==================================
-Сервер-посредник между Битрикс24 и Claude API.
-Функции: управление задачами, ответы на вопросы сотрудников, анализ отчётов.
-"""
-
 import os
 import sys
 import json
 import httpx
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
 
-# Fix encoding for Russian text
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr.reconfigure(encoding='utf-8')
+os.environ['PYTHONIOENCODING'] = 'utf-8'
 
-app = FastAPI(title="Claude Битрикс24 Ассистент")
-
-# ─── Клиент Claude ───────────────────────────────────────────────────────────
+app = FastAPI()
 claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
+chat_histories = {}
 
-# ─── Настройки Битрикс24 ─────────────────────────────────────────────────────
-B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]  # Входящий вебхук Б24
-# Формат: https://ВАШ_ДОМЕН.bitrix24.ru/rest/1/ТОКЕН/
+SYSTEM_PROMPT = "You are an AI assistant for a company integrated into Bitrix24. Always respond in Russian. Help employees with: 1) TASKS - create, track, get recommendations. 2) QUESTIONS - answer work questions. 3) REPORTS - analyze and summarize. When employee asks to create a task, extract: title, responsible person (if mentioned), deadline (if mentioned), description. Be concise, professional, friendly. If need to create a task, return JSON at the end: <action>{\"type\": \"create_task\", \"title\": \"...\", \"description\": \"...\", \"deadline\": \"YYYY-MM-DD\"}</action>. If need to get task list: <action>{\"type\": \"get_tasks\"}</action>"
 
-# ─── Хранилище истории диалогов (в памяти, для 25 сотрудников достаточно) ────
-chat_histories: dict[str, list] = {}
-
-# ─── Системный промпт для Claude ─────────────────────────────────────────────
-SYSTEM_PROMPT = """Ты — AI-ассистент компании, встроенный в Битрикс24.
-Общаешься на русском языке. Ты помогаешь сотрудникам:
-
-1. ЗАДАЧИ — создавать, отслеживать, получать рекомендации
-2. ВОПРОСЫ — отвечать на рабочие вопросы
-3. ОТЧЁТЫ — анализировать и резюмировать
-
-Когда сотрудник просит создать задачу, извлеки из его сообщения:
-- название задачи
-- ответственного (если указан)
-- дедлайн (если указан)
-- описание
-
-Отвечай кратко, по делу, дружелюбно. Если нужно создать задачу — 
-верни JSON в конце ответа в формате:
-<action>{"type": "create_task", "title": "...", "description": "...", "deadline": "YYYY-MM-DD", "responsible": "..."}</action>
-
-Если нужно получить список задач:
-<action>{"type": "get_tasks"}</action>
-"""
-
-
-# ─── Вспомогательные функции Битрикс24 ───────────────────────────────────────
-
-async def b24_request(method: str, params: dict) -> dict:
-    """Выполнить запрос к REST API Битрикс24."""
+async def b24_request(method, params):
     url = f"{B24_WEBHOOK}{method}"
     async with httpx.AsyncClient() as client:
-        response = await client.post(url, json=params, timeout=10)
-        return response.json()
+        r = await client.post(url, json=params, timeout=15)
+        return r.json()
 
-
-async def create_task(title: str, description: str = "", deadline: str = "", responsible: str = "") -> dict:
-    """Создать задачу в Битрикс24."""
-    fields = {
-        "TITLE": title,
-        "DESCRIPTION": description,
-    }
+async def create_task(title, description="", deadline=""):
+    fields = {"TITLE": title, "DESCRIPTION": description}
     if deadline:
         fields["DEADLINE"] = deadline
-    # responsible — имя или ID; если передано имя, пропускаем (нужен ID)
-    
-    result = await b24_request("tasks.task.add", {"fields": fields})
-    return result
+    return await b24_request("tasks.task.add", {"fields": fields})
 
-
-async def get_tasks() -> list:
-    """Получить список активных задач."""
+async def get_tasks():
     result = await b24_request("tasks.task.list", {
-        "filter": {"STATUS": "2"},  # статус: в работе
-        "select": ["ID", "TITLE", "DEADLINE", "STATUS", "RESPONSIBLE_ID"],
+        "filter": {"STATUS": "2"},
+        "select": ["ID", "TITLE", "DEADLINE", "STATUS"],
         "order": {"DEADLINE": "ASC"}
     })
     return result.get("result", {}).get("tasks", [])
 
-
-async def send_message_to_chat(chat_id: str, text: str):
-    """Отправить сообщение обратно в чат Битрикс24."""
-    await b24_request("im.message.add", {
-        "DIALOG_ID": chat_id,
+async def send_message(dialog_id, text):
+    await b24_request("imbot.message.add", {
+        "DIALOG_ID": dialog_id,
         "MESSAGE": text
     })
 
-
-# ─── Обработка действий из ответа Claude ─────────────────────────────────────
-
-async def process_action(action_json: str) -> str:
-    """Выполнить действие, которое Claude вернул в теге <action>."""
+async def process_action(action_json):
     try:
         action = json.loads(action_json)
-        action_type = action.get("type")
-
-        if action_type == "create_task":
+        if action.get("type") == "create_task":
             result = await create_task(
-                title=action.get("title", "Новая задача"),
+                title=action.get("title", "New task"),
                 description=action.get("description", ""),
-                deadline=action.get("deadline", ""),
-                responsible=action.get("responsible", "")
+                deadline=action.get("deadline", "")
             )
             task_id = result.get("result", {}).get("task", {}).get("id")
             if task_id:
-                return f"\n✅ Задача создана (ID: {task_id})"
-            else:
-                return "\n⚠️ Не удалось создать задачу. Проверьте настройки вебхука."
-
-        elif action_type == "get_tasks":
+                return f"\n Task created (ID: {task_id})"
+            return "\n Could not create task. Check webhook settings."
+        elif action.get("type") == "get_tasks":
             tasks = await get_tasks()
             if not tasks:
-                return "\n📋 Активных задач не найдено."
-            lines = ["\n📋 Активные задачи:"]
-            for t in tasks[:10]:  # показываем не более 10
-                deadline = t.get("deadline", "без срока")
-                lines.append(f"• [{t['id']}] {t['title']} — срок: {deadline}")
+                return "\n No active tasks found."
+            lines = ["\n Active tasks:"]
+            for t in tasks[:10]:
+                deadline = t.get("deadline", "no deadline")
+                lines.append(f"[{t['id']}] {t['title']} - due: {deadline}")
             return "\n".join(lines)
-
     except Exception as e:
-        return f"\n⚠️ Ошибка при выполнении действия: {e}"
-
+        print(f"Action error: {e}")
     return ""
 
-
-# ─── Основной обработчик сообщений ───────────────────────────────────────────
-
-async def handle_message(user_id: str, user_name: str, text: str, dialog_id: str):
-    """Обработать входящее сообщение от сотрудника."""
-
-    # Инициализация истории диалога
+async def handle_message(user_id, text, dialog_id):
     if user_id not in chat_histories:
         chat_histories[user_id] = []
-
     history = chat_histories[user_id]
     history.append({"role": "user", "content": text})
-
-    # Ограничиваем историю последними 20 сообщениями
     if len(history) > 20:
-        history = history[-20:]
-        chat_histories[user_id] = history
-
-    # Запрос к Claude
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=history
-    )
-
-    reply_text = response.content[0].text
-
-    # Добавляем ответ в историю
-    history.append({"role": "assistant", "content": reply_text})
-
-    # Проверяем, есть ли действие в ответе
-    action_result = ""
-    if "<action>" in reply_text and "</action>" in reply_text:
-        start = reply_text.index("<action>") + 8
-        end = reply_text.index("</action>")
-        action_json = reply_text[start:end]
-        action_result = await process_action(action_json)
-        # Убираем тег <action> из текста ответа
-        reply_text = reply_text[:reply_text.index("<action>")] + reply_text[end + 9:]
-
-    final_reply = reply_text.strip() + action_result
-
-    # Отправляем ответ в Битрикс24
-    await send_message_to_chat(dialog_id, final_reply)
-
-
-# ─── Эндпоинты ───────────────────────────────────────────────────────────────
+        chat_histories[user_id] = history[-20:]
+        history = chat_histories[user_id]
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=history
+        )
+        reply = response.content[0].text
+        history.append({"role": "assistant", "content": reply})
+        action_result = ""
+        if "<action>" in reply and "</action>" in reply:
+            start = reply.index("<action>") + 8
+            end = reply.index("</action>")
+            action_json = reply[start:end]
+            action_result = await process_action(action_json)
+            reply = reply[:reply.index("<action>")] + reply[end + 9:]
+        final = reply.strip() + action_result
+        await send_message(dialog_id, final)
+    except Exception as e:
+        print(f"Handle error: {e}")
+        await send_message(dialog_id, "Sorry, an error occurred. Please try again.")
 
 @app.get("/")
 async def root():
-    return {"status": "Claude Битрикс24 Ассистент работает ✅"}
-
+    return {"status": "Claude Bitrix24 Assistant is running"}
 
 @app.post("/webhook/bitrix")
-async def bitrix_webhook(request: Request):
-    """Принимает события от Битрикс24 (сообщения в чате)."""
+async def webhook(request: Request):
     try:
-        data = await request.form()
-        data = dict(data)
-
+        data = dict(await request.form())
         event = data.get("event", "")
-
-        # Обрабатываем только новые сообщения
         if event == "ONIMBOTMESSAGEADD":
             user_id = data.get("data[USER][ID]", "unknown")
-            user_name = data.get("data[USER][NAME]", "Сотрудник")
             text = data.get("data[PARAMS][MESSAGE]", "")
             dialog_id = data.get("data[PARAMS][DIALOG_ID]", "")
-
             if text and dialog_id:
-                await handle_message(user_id, user_name, text, dialog_id)
-
+                await handle_message(user_id, text, dialog_id)
         return JSONResponse({"status": "ok"})
-
     except Exception as e:
         print(f"Webhook error: {e}")
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
-
-@app.post("/api/ask")
-async def ask_directly(request: Request):
-    """Прямой API для тестирования без Битрикс24."""
-    body = await request.json()
-    user_id = body.get("user_id", "test_user")
-    text = body.get("message", "")
-
-    if not text:
-        return JSONResponse({"error": "Поле message обязательно"}, status_code=400)
-
-    if user_id not in chat_histories:
-        chat_histories[user_id] = []
-
-    history = chat_histories[user_id]
-    history.append({"role": "user", "content": text})
-
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=history
-    )
-
-    reply = response.content[0].text
-    history.append({"role": "assistant", "content": reply})
-
-    return JSONResponse({"reply": reply})
+        return JSONResponse({"status": "error"}, status_code=500)

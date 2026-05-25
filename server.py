@@ -10,16 +10,18 @@ B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
 BOT_ID = os.environ["BITRIX24_BOT_ID"]
 CLIENT_ID = os.environ["BITRIX24_CLIENT_ID"]
 chat_histories = {}
-# Запоминаем, что руководителю показано меню отчётов
 menu_shown = set()
 
 # ID сотрудников, которым доступна управленческая аналитика
 MANAGER_IDS = {"9503", "9335"}
 
-# За сколько дней назад показывать просроченные задачи
 OVERDUE_WINDOW_DAYS = 90
-# На сколько дней вперёд показывать приближающиеся дедлайны
 UPCOMING_WINDOW_DAYS = 7
+
+# Облегчённый режим: сколько страниц задач максимум перебирать (50 задач на страницу)
+MAX_TASK_PAGES = 6
+# Тайм-аут одного запроса к Bitrix
+B24_TIMEOUT = 25
 
 REPORT_MENU = (
     "Доступные отчёты:\n"
@@ -67,12 +69,10 @@ def log(msg):
 
 
 def safe_text(s):
-    """Убирает битые суррогатные символы, чтобы текст всегда кодировался в UTF-8."""
     return s.encode("utf-8", errors="ignore").decode("utf-8")
 
 
 def parse_date(s):
-    """Парсит дату из строки Bitrix (берёт первые 10 символов YYYY-MM-DD)."""
     if not s:
         return None
     try:
@@ -91,7 +91,7 @@ def b24_call(url, method, params):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=B24_TIMEOUT) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -117,7 +117,6 @@ def send_msg(dialog_id, text):
 
 
 def get_user_names(user_ids):
-    """Возвращает словарь {id: 'Имя Фамилия'} для переданных ID."""
     names = {}
     ids = [str(u) for u in user_ids if str(u).isdigit()]
     if not ids:
@@ -133,36 +132,50 @@ def get_user_names(user_ids):
     return names
 
 
-def fetch_all_tasks(extra_filter):
-    """Загружает задачи с постраничным проходом (Bitrix отдаёт по 50)."""
+def fetch_tasks_limited(extra_filter):
+    """Облегчённая загрузка: не более MAX_TASK_PAGES страниц.
+    Возвращает (список задач, было_ли_усечение)."""
     collected = []
     start = 0
-    for _ in range(40):
-        r = b24_call(
-            B24_WEBHOOK,
-            "tasks.task.list",
-            {
-                "filter": extra_filter,
-                "select": ["ID", "TITLE", "DEADLINE", "RESPONSIBLE_ID", "STATUS"],
-                "order": {"DEADLINE": "ASC"},
-                "start": start,
-            },
-        )
+    truncated = False
+    for page in range(MAX_TASK_PAGES):
+        try:
+            r = b24_call(
+                B24_WEBHOOK,
+                "tasks.task.list",
+                {
+                    "filter": extra_filter,
+                    "select": ["ID", "TITLE", "DEADLINE", "RESPONSIBLE_ID", "STATUS"],
+                    "order": {"DEADLINE": "ASC"},
+                    "start": start,
+                },
+            )
+        except Exception as e:
+            log(f"fetch_tasks_limited err on page {page}: {e}")
+            truncated = True
+            break
         batch = r.get("result", {}).get("tasks", []) or []
         collected.extend(batch)
         nxt = r.get("next")
         if not nxt:
             break
         start = nxt
-    return collected
+        if page == MAX_TASK_PAGES - 1:
+            truncated = True
+    return collected, truncated
+
+
+def trunc_note(truncated):
+    if truncated:
+        return "\n(Показаны не все задачи — данных в портале много. Для полного отчёта обратитесь к администратору.)"
+    return ""
 
 
 def action_overdue_tasks():
     today = datetime.now()
     window_start = today - timedelta(days=OVERDUE_WINDOW_DAYS)
 
-    all_active = fetch_all_tasks({"!STATUS": "5"})
-    total_active = len(all_active)
+    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
 
     overdue = []
     for t in all_active:
@@ -174,16 +187,16 @@ def action_overdue_tasks():
     overdue.sort(key=lambda x: x[1])
 
     lines = ["Сводка по задачам:"]
-    lines.append(f"- Всего активных задач: {total_active}")
+    lines.append(f"- Активных задач (просмотрено): {len(all_active)}")
     lines.append(f"- Просрочено за последние 3 месяца: {len(overdue)}")
 
     if not overdue:
         lines.append("")
         lines.append("Просроченных задач за последние 3 месяца нет.")
-        return "\n".join(lines)
+        return "\n".join(lines) + trunc_note(truncated)
 
     resp_ids = {str(t.get("responsibleId")) for t, _ in overdue if t.get("responsibleId")}
-    names = get_user_names(resp_ids)
+    names = get_user_names(list(resp_ids)[:100])
 
     lines.append("")
     lines.append("Просроченные задачи (за 3 месяца):")
@@ -195,7 +208,7 @@ def action_overdue_tasks():
         lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, срок {dl}, просрочено на {days_late} дн.")
     if len(overdue) > 30:
         lines.append(f"... и ещё {len(overdue) - 30}")
-    return "\n".join(lines)
+    return "\n".join(lines) + trunc_note(truncated)
 
 
 def action_upcoming_tasks():
@@ -203,7 +216,7 @@ def action_upcoming_tasks():
     today_day = datetime(today.year, today.month, today.day)
     window_end = today_day + timedelta(days=UPCOMING_WINDOW_DAYS)
 
-    all_active = fetch_all_tasks({"!STATUS": "5"})
+    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
 
     upcoming = []
     for t in all_active:
@@ -215,10 +228,10 @@ def action_upcoming_tasks():
     upcoming.sort(key=lambda x: x[1])
 
     if not upcoming:
-        return "На ближайшие 7 дней задач с дедлайном нет."
+        return "На ближайшие 7 дней задач с дедлайном нет." + trunc_note(truncated)
 
     resp_ids = {str(t.get("responsibleId")) for t, _ in upcoming if t.get("responsibleId")}
-    names = get_user_names(resp_ids)
+    names = get_user_names(list(resp_ids)[:100])
 
     lines = [f"Скоро дедлайн (ближайшие 7 дней) — {len(upcoming)} задач:"]
     for t, d in upcoming[:30]:
@@ -235,29 +248,28 @@ def action_upcoming_tasks():
         lines.append(f"- [{t.get('id')}] {t.get('title')} — {who}, срок {dl} ({when})")
     if len(upcoming) > 30:
         lines.append(f"... и ещё {len(upcoming) - 30}")
-    return "\n".join(lines)
+    return "\n".join(lines) + trunc_note(truncated)
 
 
 def action_workload():
-    tasks = fetch_all_tasks({"!STATUS": "5"})
+    tasks, truncated = fetch_tasks_limited({"!STATUS": "5"})
     counts = {}
     for t in tasks:
         rid = str(t.get("responsibleId", ""))
         if rid and rid != "None":
             counts[rid] = counts.get(rid, 0) + 1
     if not counts:
-        return "Нет активных задач"
-    names = get_user_names(counts.keys())
+        return "Нет активных задач" + trunc_note(truncated)
+    names = get_user_names(list(counts.keys())[:100])
     ordered = sorted(counts.items(), key=lambda x: x[1], reverse=True)
     lines = ["Загрузка по сотрудникам:"]
     for rid, cnt in ordered[:25]:
         who = names.get(rid, "ID " + rid)
         lines.append(f"- {who}: {cnt} активных")
-    return "\n".join(lines)
+    return "\n".join(lines) + trunc_note(truncated)
 
 
 def run_report(report_type):
-    """Запускает отчёт по его типу. Возвращает текст или None."""
     if report_type == "overdue_tasks":
         return action_overdue_tasks()
     if report_type == "upcoming_tasks":
@@ -267,7 +279,6 @@ def run_report(report_type):
     return None
 
 
-# Соответствие цифры из меню типу отчёта
 MENU_CHOICES = {
     "1": "overdue_tasks",
     "2": "upcoming_tasks",
@@ -329,14 +340,14 @@ def do_action(action_json, responsible_id, is_manager):
 
 
 def process_message(uid, text, dialog_id):
-    """Тяжёлая обработка — выполняется в фоне, Bitrix её уже не ждёт."""
+    """Тяжёлая обработка — в фоне, Bitrix её не ждёт."""
     try:
         is_manager = str(uid) in MANAGER_IDS
         stripped = text.strip()
 
-        # Руководитель прислал цифру сразу после меню — запускаем отчёт
         if is_manager and uid in menu_shown and stripped in MENU_CHOICES:
             menu_shown.discard(uid)
+            send_msg(dialog_id, "Готовлю отчёт, несколько секунд...")
             report = run_report(MENU_CHOICES[stripped])
             send_msg(dialog_id, report if report else "[!] Неизвестный отчёт")
             return
@@ -390,7 +401,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             dlg = data.get("data[PARAMS][DIALOG_ID]", "")
             log(f"Msg uid={uid} dlg={dlg} text={text[:20]}")
             if text and dlg:
-                # Тяжёлую работу уводим в фон, Bitrix получает ответ сразу
                 background_tasks.add_task(process_message, uid, text, dlg)
         return JSONResponse({"status": "ok"})
     except Exception as e:

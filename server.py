@@ -21,18 +21,22 @@ UPCOMING_WINDOW_DAYS = 7
 # Облегчённый режим: максимум страниц задач (50 на страницу)
 MAX_TASK_PAGES = 6
 B24_TIMEOUT = 25
+# Сколько строк показывать в списках (ограничение длины сообщения Bitrix)
+LIST_LIMIT = 30
 
 REPORT_MENU = (
     "Доступные отчёты:\n"
-    "1 — Просроченные задачи (за 3 месяца)\n"
+    "1 — Общая сводка по задачам\n"
     "2 — Скоро дедлайн (ближайшие 7 дней)\n"
-    "3 — Общая сводка по задачам\n\n"
+    "3 — Просроченные задачи (за 3 месяца)\n"
+    "4 — Все активные задачи\n"
+    "5 — Задачи без срока\n\n"
     "Напишите номер отчёта."
 )
 
 BASE_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
 
-MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"report_menu\"}</action> when the user asks for the list of reports or a menu; <action>{\"type\":\"overdue_tasks\"}</action> for overdue tasks from the last 3 months; <action>{\"type\":\"upcoming_tasks\"}</action> for tasks with a deadline within the next 7 days; <action>{\"type\":\"summary\"}</action> for an overall summary of tasks."
+MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"report_menu\"}</action> when the user asks for the list of reports or a menu; <action>{\"type\":\"summary\"}</action> for an overall summary; <action>{\"type\":\"upcoming_tasks\"}</action> for tasks with a deadline within the next 7 days; <action>{\"type\":\"overdue_tasks\"}</action> for overdue tasks from the last 3 months; <action>{\"type\":\"all_active\"}</action> for the list of all active tasks; <action>{\"type\":\"no_deadline\"}</action> for tasks without a deadline."
 
 WEEKDAYS_RU = [
     "\u043f\u043e\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0438\u043a",
@@ -143,9 +147,8 @@ def fetch_tasks_limited(extra_filter):
             "select": ["ID", "TITLE", "DEADLINE", "RESPONSIBLE_ID", "STATUS", "PARENT_ID"],
             "order": {"DEADLINE": "ASC"},
             "start": start,
+            "SUBTASKS": "Y",
         }
-        # SUBTASKS=Y просит Bitrix включать подзадачи в выдачу
-        params["SUBTASKS"] = "Y"
         try:
             r = b24_call(B24_WEBHOOK, "tasks.task.list", params)
         except Exception as e:
@@ -180,80 +183,19 @@ def parent_label(t):
 def task_line(t, names, suffix):
     rid = str(t.get("responsibleId", ""))
     who = names.get(rid, "ID " + rid)
-    return f"- [{t.get('id')}] {t.get('title')} — {who}, {suffix}{parent_label(t)}"
+    extra = (" — " + suffix) if suffix else ""
+    return f"- [{t.get('id')}] {t.get('title')} — {who}{extra}{parent_label(t)}"
 
 
-def action_overdue_tasks():
-    today = datetime.now()
-    window_start = today - timedelta(days=OVERDUE_WINDOW_DAYS)
-
-    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
-
-    overdue = []
-    for t in all_active:
-        d = parse_date(t.get("deadline"))
-        if d is None:
-            continue
-        if window_start <= d < today:
-            overdue.append((t, d))
-    overdue.sort(key=lambda x: x[1])
-
-    lines = ["Сводка по задачам:"]
-    lines.append(f"- Активных задач (просмотрено, с подзадачами): {len(all_active)}")
-    lines.append(f"- Просрочено за последние 3 месяца: {len(overdue)}")
-
-    if not overdue:
-        lines.append("")
-        lines.append("Просроченных задач за последние 3 месяца нет.")
-        return "\n".join(lines) + trunc_note(truncated)
-
-    resp_ids = {str(t.get("responsibleId")) for t, _ in overdue if t.get("responsibleId")}
-    names = get_user_names(list(resp_ids)[:100])
-
-    lines.append("")
-    lines.append("Просроченные задачи (за 3 месяца):")
-    for t, d in overdue[:30]:
-        days_late = (today - d).days
-        lines.append(task_line(t, names, f"срок {d.strftime('%Y-%m-%d')}, просрочено на {days_late} дн."))
-    if len(overdue) > 30:
-        lines.append(f"... и ещё {len(overdue) - 30}")
-    return "\n".join(lines) + trunc_note(truncated)
-
-
-def action_upcoming_tasks():
-    today = datetime.now()
-    today_day = datetime(today.year, today.month, today.day)
-    window_end = today_day + timedelta(days=UPCOMING_WINDOW_DAYS)
-
-    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
-
-    upcoming = []
-    for t in all_active:
-        d = parse_date(t.get("deadline"))
-        if d is None:
-            continue
-        if today_day <= d <= window_end:
-            upcoming.append((t, d))
-    upcoming.sort(key=lambda x: x[1])
-
-    if not upcoming:
-        return "На ближайшие 7 дней задач с дедлайном нет." + trunc_note(truncated)
-
-    resp_ids = {str(t.get("responsibleId")) for t, _ in upcoming if t.get("responsibleId")}
-    names = get_user_names(list(resp_ids)[:100])
-
-    lines = [f"Скоро дедлайн (ближайшие 7 дней) — {len(upcoming)} задач:"]
-    for t, d in upcoming[:30]:
-        days_left = (d - today_day).days
-        if days_left == 0:
-            when = "сегодня"
-        elif days_left == 1:
-            when = "завтра"
-        else:
-            when = f"через {days_left} дн."
-        lines.append(task_line(t, names, f"срок {d.strftime('%Y-%m-%d')} ({when})"))
-    if len(upcoming) > 30:
-        lines.append(f"... и ещё {len(upcoming) - 30}")
+def render_list(title, items_with_suffix, total_count, truncated):
+    """items_with_suffix: список кортежей (task, suffix). Готовит текст со срезом."""
+    resp_ids = {str(t.get("responsibleId")) for t, _ in items_with_suffix if t.get("responsibleId")}
+    names = get_user_names(list(resp_ids)[:120])
+    lines = [f"{title} — {total_count} задач:"]
+    for t, suffix in items_with_suffix[:LIST_LIMIT]:
+        lines.append(task_line(t, names, suffix))
+    if total_count > LIST_LIMIT:
+        lines.append(f"... и ещё {total_count - LIST_LIMIT} — показаны не все")
     return "\n".join(lines) + trunc_note(truncated)
 
 
@@ -287,24 +229,107 @@ def action_summary():
     lines.append(f"- Скоро дедлайн (7 дней): {upcoming}")
     lines.append(f"- Без срока: {no_deadline}")
     lines.append("")
-    lines.append("Для детальных списков выберите отчёт 1 или 2 в меню.")
+    lines.append("Для детальных списков выберите отчёт 2-5 в меню.")
     return "\n".join(lines) + trunc_note(truncated)
 
 
+def action_upcoming_tasks():
+    today = datetime.now()
+    today_day = datetime(today.year, today.month, today.day)
+    window_end = today_day + timedelta(days=UPCOMING_WINDOW_DAYS)
+
+    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
+
+    upcoming = []
+    for t in all_active:
+        d = parse_date(t.get("deadline"))
+        if d is None:
+            continue
+        if today_day <= d <= window_end:
+            upcoming.append((t, d))
+    upcoming.sort(key=lambda x: x[1])
+
+    if not upcoming:
+        return "На ближайшие 7 дней задач с дедлайном нет." + trunc_note(truncated)
+
+    items = []
+    for t, d in upcoming:
+        days_left = (d - today_day).days
+        if days_left == 0:
+            when = "сегодня"
+        elif days_left == 1:
+            when = "завтра"
+        else:
+            when = f"через {days_left} дн."
+        items.append((t, f"срок {d.strftime('%Y-%m-%d')} ({when})"))
+    return render_list("Скоро дедлайн (ближайшие 7 дней)", items, len(items), truncated)
+
+
+def action_overdue_tasks():
+    today = datetime.now()
+    window_start = today - timedelta(days=OVERDUE_WINDOW_DAYS)
+
+    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
+
+    overdue = []
+    for t in all_active:
+        d = parse_date(t.get("deadline"))
+        if d is None:
+            continue
+        if window_start <= d < today:
+            overdue.append((t, d))
+    overdue.sort(key=lambda x: x[1])
+
+    if not overdue:
+        return "Просроченных задач за последние 3 месяца нет." + trunc_note(truncated)
+
+    items = []
+    for t, d in overdue:
+        days_late = (today - d).days
+        items.append((t, f"срок {d.strftime('%Y-%m-%d')}, просрочено на {days_late} дн."))
+    return render_list("Просроченные задачи (за 3 месяца)", items, len(items), truncated)
+
+
+def action_all_active():
+    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
+    if not all_active:
+        return "Активных задач нет." + trunc_note(truncated)
+    items = []
+    for t in all_active:
+        d = parse_date(t.get("deadline"))
+        suffix = ("срок " + d.strftime("%Y-%m-%d")) if d else "без срока"
+        items.append((t, suffix))
+    return render_list("Все активные задачи", items, len(items), truncated)
+
+
+def action_no_deadline():
+    all_active, truncated = fetch_tasks_limited({"!STATUS": "5"})
+    items = [(t, "") for t in all_active if parse_date(t.get("deadline")) is None]
+    if not items:
+        return "Задач без срока нет." + trunc_note(truncated)
+    return render_list("Задачи без срока", items, len(items), truncated)
+
+
 def run_report(report_type):
-    if report_type == "overdue_tasks":
-        return action_overdue_tasks()
-    if report_type == "upcoming_tasks":
-        return action_upcoming_tasks()
     if report_type == "summary":
         return action_summary()
+    if report_type == "upcoming_tasks":
+        return action_upcoming_tasks()
+    if report_type == "overdue_tasks":
+        return action_overdue_tasks()
+    if report_type == "all_active":
+        return action_all_active()
+    if report_type == "no_deadline":
+        return action_no_deadline()
     return None
 
 
 MENU_CHOICES = {
-    "1": "overdue_tasks",
+    "1": "summary",
     "2": "upcoming_tasks",
-    "3": "summary",
+    "3": "overdue_tasks",
+    "4": "all_active",
+    "5": "no_deadline",
 }
 
 
@@ -348,7 +373,7 @@ def do_action(action_json, responsible_id, is_manager):
                 lines.append(f"- [{t['id']}] {t['title']}")
             return "\n".join(lines)
 
-        if atype in ("report_menu", "overdue_tasks", "upcoming_tasks", "summary"):
+        if atype in ("report_menu", "summary", "upcoming_tasks", "overdue_tasks", "all_active", "no_deadline"):
             if not is_manager:
                 return "\n[Доступ ограничен] Эта информация доступна только руководителям"
             if atype == "report_menu":

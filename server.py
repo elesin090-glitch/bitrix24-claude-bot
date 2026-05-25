@@ -16,7 +16,7 @@ chat_histories = {}
 SYSTEM_PROMPT = "You are an AI assistant for a company integrated into Bitrix24. Always respond in Russian. Help employees with tasks, questions, and reports. When asked to create a task, extract title, deadline, description and return: <action>{\"type\": \"create_task\", \"title\": \"...\", \"description\": \"...\", \"deadline\": \"YYYY-MM-DD\"}</action>. When asked for task list return: <action>{\"type\": \"get_tasks\"}</action>"
 
 def b24_request(method, params):
-    url = (B24_WEBHOOK + method).encode('ascii')
+    url = B24_WEBHOOK + method
     data = json.dumps(params, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request(
         url,

@@ -10,6 +10,8 @@ B24_WEBHOOK = os.environ["BITRIX24_WEBHOOK"]
 BOT_ID = os.environ["BITRIX24_BOT_ID"]
 CLIENT_ID = os.environ["BITRIX24_CLIENT_ID"]
 chat_histories = {}
+# Запоминаем, что руководителю показано меню отчётов (чтобы понять цифру в ответ)
+menu_shown = set()
 
 # ID сотрудников, которым доступна управленческая аналитика
 MANAGER_IDS = {"9503", "9335"}
@@ -19,9 +21,17 @@ OVERDUE_WINDOW_DAYS = 90
 # На сколько дней вперёд показывать приближающиеся дедлайны
 UPCOMING_WINDOW_DAYS = 7
 
+REPORT_MENU = (
+    "Доступные отчёты:\n"
+    "1 — Просроченные задачи (за 3 месяца)\n"
+    "2 — Скоро дедлайн (ближайшие 7 дней)\n"
+    "3 — Загрузка по сотрудникам\n\n"
+    "Напишите номер отчёта."
+)
+
 BASE_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
 
-MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"overdue_tasks\"}</action> for overdue tasks from the last 3 months with a summary; <action>{\"type\":\"upcoming_tasks\"}</action> for tasks with a deadline within the next 7 days (deadline soon); <action>{\"type\":\"workload\"}</action> for how many active tasks each employee has."
+MANAGER_PROMPT = " This user is a manager. You may also use these analytics actions: <action>{\"type\":\"report_menu\"}</action> when the user asks for the list of reports or a menu; <action>{\"type\":\"overdue_tasks\"}</action> for overdue tasks from the last 3 months with a summary; <action>{\"type\":\"upcoming_tasks\"}</action> for tasks with a deadline within the next 7 days; <action>{\"type\":\"workload\"}</action> for how many active tasks each employee has."
 
 WEEKDAYS_RU = [
     "\u043f\u043e\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0438\u043a",
@@ -246,6 +256,25 @@ def action_workload():
     return "\n".join(lines)
 
 
+def run_report(report_type):
+    """Запускает отчёт по его типу. Возвращает текст или None."""
+    if report_type == "overdue_tasks":
+        return action_overdue_tasks()
+    if report_type == "upcoming_tasks":
+        return action_upcoming_tasks()
+    if report_type == "workload":
+        return action_workload()
+    return None
+
+
+# Соответствие цифры из меню типу отчёта
+MENU_CHOICES = {
+    "1": "overdue_tasks",
+    "2": "upcoming_tasks",
+    "3": "workload",
+}
+
+
 def do_action(action_json, responsible_id, is_manager):
     try:
         a = json.loads(action_json)
@@ -286,14 +315,12 @@ def do_action(action_json, responsible_id, is_manager):
                 lines.append(f"- [{t['id']}] {t['title']}")
             return "\n".join(lines)
 
-        if atype in ("overdue_tasks", "upcoming_tasks", "workload"):
+        if atype in ("report_menu", "overdue_tasks", "upcoming_tasks", "workload"):
             if not is_manager:
                 return "\n[Доступ ограничен] Эта информация доступна только руководителям"
-            if atype == "overdue_tasks":
-                return action_overdue_tasks()
-            if atype == "upcoming_tasks":
-                return action_upcoming_tasks()
-            return action_workload()
+            if atype == "report_menu":
+                return "\n" + REPORT_MENU
+            return run_report(atype)
 
     except Exception as e:
         log(f"Action err: {e}")
@@ -303,6 +330,15 @@ def do_action(action_json, responsible_id, is_manager):
 
 def handle(uid, text, dialog_id):
     is_manager = str(uid) in MANAGER_IDS
+    stripped = text.strip()
+
+    # Если руководителю было показано меню и он прислал цифру — сразу запускаем отчёт
+    if is_manager and uid in menu_shown and stripped in MENU_CHOICES:
+        menu_shown.discard(uid)
+        report = run_report(MENU_CHOICES[stripped])
+        send_msg(dialog_id, report if report else "[!] Неизвестный отчёт")
+        return
+
     if uid not in chat_histories:
         chat_histories[uid] = []
     hist = chat_histories[uid]
@@ -323,8 +359,12 @@ def handle(uid, text, dialog_id):
         if "<action>" in reply and "</action>" in reply:
             s = reply.index("<action>") + 8
             e_idx = reply.index("</action>")
-            extra = do_action(reply[s:e_idx], uid, is_manager)
+            action_body = reply[s:e_idx]
+            extra = do_action(action_body, uid, is_manager)
             reply = reply[:reply.index("<action>")] + reply[e_idx + 9:]
+            # Если показали меню — запоминаем, чтобы понять цифру в следующем сообщении
+            if '"report_menu"' in action_body and is_manager:
+                menu_shown.add(uid)
         send_msg(dialog_id, reply.strip() + extra)
     except Exception as ex:
         log(f"Handle err: {ex}")

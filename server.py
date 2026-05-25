@@ -1,4 +1,5 @@
 import os, sys, json, urllib.request
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
@@ -10,7 +11,28 @@ BOT_ID = os.environ["BITRIX24_BOT_ID"]
 CLIENT_ID = os.environ["BITRIX24_CLIENT_ID"]
 chat_histories = {}
 
-SYSTEM_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
+BASE_PROMPT = "You are a helpful AI assistant for a company in Bitrix24. Always respond in Russian language. Help with: 1) creating and tracking tasks 2) answering employee questions 3) analyzing reports. For tasks use: <action>{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\",\"deadline\":\"YYYY-MM-DD\"}</action> For task list: <action>{\"type\":\"get_tasks\"}</action>"
+
+WEEKDAYS_RU = [
+    "\u043f\u043e\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0438\u043a",
+    "\u0432\u0442\u043e\u0440\u043d\u0438\u043a",
+    "\u0441\u0440\u0435\u0434\u0430",
+    "\u0447\u0435\u0442\u0432\u0435\u0440\u0433",
+    "\u043f\u044f\u0442\u043d\u0438\u0446\u0430",
+    "\u0441\u0443\u0431\u0431\u043e\u0442\u0430",
+    "\u0432\u043e\u0441\u043a\u0440\u0435\u0441\u0435\u043d\u044c\u0435",
+]
+
+
+def build_system_prompt():
+    today = datetime.now()
+    lines = ["", "", "Today is " + today.strftime("%Y-%m-%d") + " (" + WEEKDAYS_RU[today.weekday()] + ")."]
+    lines.append("Upcoming dates for reference:")
+    for i in range(1, 15):
+        d = today + timedelta(days=i)
+        lines.append("  " + WEEKDAYS_RU[d.weekday()] + ": " + d.strftime("%Y-%m-%d"))
+    lines.append("When the user mentions a weekday or a relative day, use the matching date from this list. Never invent dates and never use dates in the past.")
+    return BASE_PROMPT + "\n".join(lines)
 
 
 def log(msg):
@@ -97,7 +119,7 @@ def handle(uid, text, dialog_id):
         resp = claude.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=1000,
-            system=SYSTEM_PROMPT,
+            system=build_system_prompt(),
             messages=hist,
         )
         reply = resp.content[0].text
